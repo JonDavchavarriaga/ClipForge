@@ -113,14 +113,13 @@ def probe(path):
     return Media(3600 * hours + 60 * minutes + secs, len(re.findall(r'Stream .*Audio:', info)), width, height)
 
 
-def _hybrid_seek_args(source: Path, start: float, duration: float) -> list[str]:
-    """Fast-seek 2s before target then frame-accurately seek the final delta so PTS aligns cleanly."""
+def _seek_window(start: float, duration: float) -> tuple[float, float, float]:
+    """Split seek into fast input seek `pre` + filter-level exact trim `fine` so ASS never burns before cut."""
     safe_start = max(0.0, float(start))
+    dur = max(0.5, float(duration))
     if safe_start > 2.5:
-        pre = safe_start - 2.0
-        fine = 2.0
-        return ['-fflags', '+genpts', '-ss', f'{pre:.6f}', '-i', str(source), '-ss', f'{fine:.6f}', '-t', f'{duration:.6f}']
-    return ['-fflags', '+genpts', '-i', str(source), '-ss', f'{safe_start:.6f}', '-t', f'{duration:.6f}']
+        return safe_start - 2.0, 2.0, dur
+    return 0.0, safe_start, dur
 
 
 def audio_preview(source, output, track, *, cancel_event: threading.Event | None = None):
@@ -136,18 +135,21 @@ def audio_preview(source, output, track, *, cancel_event: threading.Event | None
 
 
 def extract_clip_wav(source: Path, start: float, end: float, output_wav: Path, track: int, *, cancel_event=None) -> Path:
-    """Extract clip-exact 16kHz mono PCM WAV using identical hybrid seek as render() for zero subtitle drift."""
-    duration = max(0.5, float(end) - float(start))
-    args = [
-        *_hybrid_seek_args(Path(source), start, duration),
+    """Extract clip-exact 16kHz mono PCM WAV using identical filtergraph trim as render() for 0ms drift."""
+    pre, fine, duration = _seek_window(start, float(end) - float(start))
+    args: list = []
+    if pre > 0.0:
+        args.extend(['-ss', f'{pre:.6f}'])
+    args.extend([
+        '-i', str(source),
         '-map', f'0:a:{track}',
-        '-af', 'asetpts=PTS-STARTPTS',
+        '-af', f'atrim=start={fine:.6f}:duration={duration:.6f},asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0',
         '-ac', '1',
         '-ar', '16000',
         '-c:a', 'pcm_s16le',
         '-y',
         output_wav,
-    ]
+    ])
     run(args, cancel_event=cancel_event)
     return output_wav
 
@@ -395,35 +397,43 @@ def render(
     *,
     captions_file=None,
     cam_region=None,
+    cam_split_pct: int = 33,
     volume_db: float = 0.0,
     cancel_event: threading.Event | None = None,
 ):
     target = Path(target)
     temp_target = target.with_name(f'.tmp-{target.name}')
     caption_step = _caption_filter(has_captions, captions_file)
-    duration = max(0.5, float(end) - float(start))
-    args = [*_hybrid_seek_args(Path(source), start, duration)]
+    pre, fine, duration = _seek_window(start, float(end) - float(start))
+    args: list = []
+    if pre > 0.0:
+        args.extend(['-ss', f'{pre:.6f}'])
+    args.extend(['-i', str(source)])
 
+    vtrim = f'trim=start={fine:.6f}:duration={duration:.6f},setpts=PTS-STARTPTS'
     if layout == 'split-cam':
         region = cam_region or CAM_PRESETS['bottom-right']
+        split_pct = max(20, min(55, int(cam_split_pct or 33)))
+        top_h = max(320, min(1060, int(round((1920 * split_pct / 100.0) / 2.0) * 2)))
+        bottom_h = 1920 - top_h
         top_crop = (
             f"crop=w='max(2,trunc(iw*{region.w:.6f}/2)*2)':"
             f"h='max(2,trunc(ih*{region.h:.6f}/2)*2)':"
             f"x='trunc(iw*{region.x:.6f}/2)*2':"
             f"y='trunc(ih*{region.y:.6f}/2)*2'"
         )
-        post_steps = ['vstack=inputs=2', 'drawbox=x=0:y=638:w=1080:h=4:color=black@0.85:t=fill']
+        post_steps = ['vstack=inputs=2', f'drawbox=x=0:y={top_h - 2}:w=1080:h=4:color=black@0.85:t=fill']
         if caption_step:
             post_steps.append(caption_step)
         graph = (
-            '[0:v:0]setpts=PTS-STARTPTS,scale=trunc(iw*sar/2)*2:ih,setsar=1,fps=30,split=2[vcam][vgame];'
-            f'[vcam]{top_crop},scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[top];'
-            '[vgame]scale=1080:1280:force_original_aspect_ratio=increase,crop=1080:1280[bottom];'
+            f'[0:v:0]{vtrim},scale=trunc(iw*sar/2)*2:ih,setsar=1,fps=30,split=2[vcam][vgame];'
+            f'[vcam]{top_crop},scale=1080:{top_h}:force_original_aspect_ratio=increase,crop=1080:{top_h}[top];'
+            f'[vgame]scale=1080:{bottom_h}:force_original_aspect_ratio=increase,crop=1080:{bottom_h}[bottom];'
             f'[top][bottom]{",".join(post_steps)}[vout]'
         )
         args.extend(['-filter_complex', graph, '-map', '[vout]'])
     else:
-        filters = ['setpts=PTS-STARTPTS', 'scale=trunc(iw*sar/2)*2:ih', 'setsar=1', 'fps=30']
+        filters = [vtrim, 'scale=trunc(iw*sar/2)*2:ih', 'setsar=1', 'fps=30']
         if layout == 'fit':
             filters.extend([
                 'scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2',
@@ -441,7 +451,12 @@ def render(
         args.extend(['-map', '0:v:0', '-vf', ','.join(filters)])
 
     if track is not None:
-        effects = ['asetpts=PTS-STARTPTS', 'highpass=f=65']
+        effects = [
+            f'atrim=start={fine:.6f}:duration={duration:.6f}',
+            'asetpts=PTS-STARTPTS',
+            'aresample=async=1:first_pts=0',
+            'highpass=f=65',
+        ]
         if denoise:
             effects.append('afftdn=nr=10')
         effects.append('loudnorm=I=-16:TP=-1.5:LRA=11')

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sys
 import threading
 from urllib.request import Request, urlopen
 
@@ -18,11 +19,38 @@ from clipforge.publishing.publication import save_json
 TRANSLATION_RULES_PATH = AGENTS_DIR / 'rules' / 'translation-style.md'
 
 
+def resolve_cli_executable(name: str) -> str | None:
+    """Find an executable CLI safely on Windows, avoiding extensionless npm Unix shims (WinError 193)."""
+    if sys.platform == 'win32':
+        for candidate in (f'{name}.exe', f'{name}.cmd', f'{name}.bat', f'{name}.ps1'):
+            found = shutil.which(candidate)
+            if found:
+                return found
+        found = shutil.which(name)
+        if found and Path(found).suffix.lower() in {'.exe', '.cmd', '.bat', '.ps1'}:
+            return found
+        return None
+    return shutil.which(name)
+
+
+def build_cli_command(exe: str, extra_args: list[str]) -> list[str]:
+    """Wrap .cmd/.bat/.ps1 shims on Windows so CreateProcess never raises WinError 193."""
+    suffix = Path(exe).suffix.lower()
+    if sys.platform == 'win32':
+        if suffix in {'.cmd', '.bat'}:
+            comspec = os.environ.get('COMSPEC') or 'cmd.exe'
+            return [comspec, '/d', '/s', '/c', exe, *extra_args]
+        if suffix == '.ps1':
+            pwsh = shutil.which('pwsh') or shutil.which('powershell') or 'powershell.exe'
+            return [pwsh, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', exe, *extra_args]
+    return [exe, *extra_args]
+
+
 def available_translators() -> dict[str, dict]:
-    """Detect which local AI translation engines are available on this PC."""
-    claude_exe = shutil.which('claude')
-    codex_exe = shutil.which('codex')
-    gemini_exe = shutil.which('gemini')
+    """Detect which local AI subscription CLIs are installed and runnable on this PC."""
+    claude_exe = resolve_cli_executable('claude')
+    codex_exe = resolve_cli_executable('codex')
+    gemini_exe = resolve_cli_executable('gemini')
     gemini_key = bool(os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY'))
     return {
         'claude': {'available': bool(claude_exe), 'label': 'Claude Code', 'mode': 'cli' if claude_exe else 'none'},
@@ -105,24 +133,22 @@ def _invoke_gemini_api(prompt: str) -> str:
 
 def invoke_translator_engine(engine: str, prompt: str, *, cancel_event: threading.Event | None = None) -> str:
     engine = engine.strip().lower()
+    env = os.environ.copy()
+    env.pop('CLAUDECODE', None)
     if engine == 'claude':
-        exe = shutil.which('claude')
+        exe = resolve_cli_executable('claude')
         if not exe:
-            raise RuntimeError('Claude Code (`claude`) no está disponible en el PATH.')
-        cmd = [exe, '-p']
+            raise RuntimeError('Claude Code (`claude`) no está disponible en este PC. Elige Codex o instala Claude Code.')
+        cmd = build_cli_command(exe, ['-p', '--output-format', 'text'])
     elif engine == 'codex':
-        exe = shutil.which('codex')
+        exe = resolve_cli_executable('codex')
         if not exe:
-            raise RuntimeError('Codex (`codex`) no está disponible en el PATH.')
-        if exe.lower().endswith('.ps1'):
-            pwsh = shutil.which('pwsh') or shutil.which('powershell') or 'powershell'
-            cmd = [pwsh, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', exe, 'exec', '-']
-        else:
-            cmd = [exe, 'exec', '-']
+            raise RuntimeError('Codex (`codex`) no está disponible en este PC. Elige Claude Code o instala Codex CLI.')
+        cmd = build_cli_command(exe, ['exec', '--skip-git-repo-check', '--ephemeral', '-s', 'read-only', '-'])
     elif engine == 'gemini':
-        exe = shutil.which('gemini')
+        exe = resolve_cli_executable('gemini')
         if exe:
-            cmd = [exe, '-p', '']
+            cmd = build_cli_command(exe, ['-p', ''])
         else:
             return _invoke_gemini_api(prompt)
     else:
@@ -131,6 +157,7 @@ def invoke_translator_engine(engine: str, prompt: str, *, cancel_event: threadin
     completed = REGISTRY.run_managed(
         cmd,
         cwd=ROOT_DIR,
+        env=env,
         input_text=prompt,
         timeout=180,
         cancel_event=cancel_event,

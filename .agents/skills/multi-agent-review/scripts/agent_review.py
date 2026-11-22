@@ -6,6 +6,7 @@ to `claude -p` and/or `codex exec -`, and stores the response in .agents/handoff
 
 import argparse
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -60,29 +61,49 @@ def build_prompt(role_name: str, task: str, input_path: Path, include_glossary: 
     return '\n\n'.join(sections) + '\n'
 
 
+def _find_cli(name: str) -> str | None:
+    if sys.platform == 'win32':
+        for candidate in (f'{name}.exe', f'{name}.cmd', f'{name}.bat', f'{name}.ps1'):
+            found = shutil.which(candidate)
+            if found:
+                return found
+    return shutil.which(name)
+
+
+def _wrap_cli(exe: str, extra: list[str]) -> list[str]:
+    suffix = Path(exe).suffix.lower()
+    if sys.platform == 'win32':
+        if suffix in {'.cmd', '.bat'}:
+            return [os.environ.get('COMSPEC') or 'cmd.exe', '/d', '/s', '/c', exe, *extra]
+        if suffix == '.ps1':
+            pwsh = shutil.which('pwsh') or shutil.which('powershell') or 'powershell.exe'
+            return [pwsh, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', exe, *extra]
+    return [exe, *extra]
+
+
 def resolve_cli_command(agent: str) -> list[str]:
     if agent == 'claude':
-        exe = shutil.which('claude')
+        exe = _find_cli('claude')
         if not exe:
             raise RuntimeError('No se encontró `claude` en el PATH.')
-        return [exe, '-p']
+        return _wrap_cli(exe, ['-p', '--output-format', 'text'])
     if agent == 'codex':
-        exe = shutil.which('codex')
+        exe = _find_cli('codex')
         if not exe:
             raise RuntimeError('No se encontró `codex` en el PATH.')
-        if exe.lower().endswith('.ps1'):
-            pwsh = shutil.which('pwsh') or shutil.which('powershell') or 'powershell'
-            return [pwsh, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', exe, 'exec', '-']
-        return [exe, 'exec', '-']
+        return _wrap_cli(exe, ['exec', '--skip-git-repo-check', '--ephemeral', '-s', 'read-only', '-'])
     raise ValueError(f'Agente no soportado: {agent}')
 
 
 def run_agent(agent: str, prompt: str, timeout: int) -> tuple[int, str, str]:
     cmd = resolve_cli_command(agent)
+    env = os.environ.copy()
+    env.pop('CLAUDECODE', None)
     completed = subprocess.run(
         cmd,
         input=prompt,
         cwd=ROOT_DIR,
+        env=env,
         capture_output=True,
         text=True,
         encoding='utf-8',

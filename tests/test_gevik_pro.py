@@ -24,7 +24,9 @@ from clipforge.desktop.server import create_server
 from clipforge.logging_utils import close_logging
 from clipforge.pipeline.auto_translate import (
     available_translators,
+    build_cli_command,
     extract_json_object,
+    resolve_cli_executable,
     translate_clip_with_agent,
 )
 from clipforge.pipeline.editor import edit_clip
@@ -71,6 +73,14 @@ class GevikProTests(unittest.TestCase):
         for key in ('claude', 'codex', 'gemini'):
             self.assertIn('available', translators[key])
             self.assertIn('label', translators[key])
+
+        # On Windows, resolved codex executable must have a runnable extension (never Unix shim)
+        if sys.platform == 'win32':
+            codex_exe = resolve_cli_executable('codex')
+            if codex_exe:
+                self.assertIn(Path(codex_exe).suffix.lower(), {'.exe', '.cmd', '.bat', '.ps1'})
+                cmd = build_cli_command(codex_exe, ['exec', '-'])
+                self.assertGreaterEqual(len(cmd), 3)
 
     def test_translate_clip_with_agent_preserves_timestamps(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,22 +188,24 @@ class GevikProTests(unittest.TestCase):
             extract_clip_wav(src, 2.0, 5.0, wav, 0)
             self.assertTrue(wav.is_file() and wav.stat().st_size > 1000)
 
-            # Test integrated Mini-Editor: Trim IN/OUT + silver style + top position + offset + volume
+            # Test integrated Mini-Editor: Trim IN/OUT + silver style + custom Y% + cam split% + offset + volume
             edited = edit_clip(
                 batch_dir,
                 'clip-01',
                 start=2.0,
                 end=5.5,
+                cam_split_pct=42,
                 caption_style='silver',
-                subtitle_position='top',
+                subtitle_y_pct=38,
                 subtitle_offset_ms=120,
                 volume_db=3.0,
                 denoise=False,
             )
             self.assertAlmostEqual(edited['start'], 2.0, places=2)
             self.assertAlmostEqual(edited['end'], 5.5, places=2)
+            self.assertEqual(edited['cam_split_pct'], 42)
             self.assertEqual(edited['caption_style'], 'silver')
-            self.assertEqual(edited['subtitle_position'], 'top')
+            self.assertEqual(edited['subtitle_y_pct'], 38)
             self.assertEqual(edited['subtitle_offset_ms'], 120)
             self.assertEqual(edited['volume_db'], 3.0)
             edited_info = probe(batch_dir / 'clip-01' / 'video.mp4')
@@ -335,6 +347,27 @@ class GevikProTests(unittest.TestCase):
                 purged = post('/api/clip/purge-discarded', {'batch': 'lote-demo123'})
                 self.assertEqual(purged['purged'], 1)
                 self.assertFalse(clip_dir.exists())
+
+                # Library deletion: delete full live recording session folder & live clip
+                rec_session = state.workspace.live_recordings_dir / 'twitch-demo-20261122-010101'
+                rec_session.mkdir(parents=True)
+                rec_file = rec_session / 'full_recording.mp4'
+                rec_file.write_bytes(src.read_bytes())
+                live_clip = state.workspace.live_clips_dir / 'clip-auto-01.mp4'
+                live_clip.write_bytes(src.read_bytes())
+
+                with urlopen(f'{base}/api/library') as resp:
+                    lib = json.loads(resp.read().decode('utf-8'))
+                    self.assertTrue(any(i['path'] == str(rec_file.resolve()) for i in lib['live_recordings']))
+                    self.assertTrue(any(i['path'] == str(live_clip.resolve()) for i in lib['live_clips']))
+
+                del_rec = post('/api/library/delete', {'path': str(rec_file)})
+                self.assertTrue(del_rec['deleted'])
+                self.assertFalse(rec_session.exists())
+
+                del_clip = post('/api/library/delete', {'path': str(live_clip)})
+                self.assertTrue(del_clip['deleted'])
+                self.assertFalse(live_clip.exists())
             finally:
                 server.shutdown()
                 server.server_close()

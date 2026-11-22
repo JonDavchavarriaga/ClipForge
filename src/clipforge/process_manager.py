@@ -68,6 +68,7 @@ class ProcessRegistry:
         cmd: list[str],
         *,
         cwd: Path | str | None = None,
+        env: dict[str, str] | None = None,
         input_text: str | None = None,
         timeout: float | None = None,
         text: bool = True,
@@ -77,6 +78,7 @@ class ProcessRegistry:
         flags = BACKGROUND_FLAGS if low_priority else CREATE_NO_WINDOW
         kwargs: dict = {
             'cwd': cwd,
+            'env': env,
             'stdin': subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             'stdout': subprocess.PIPE,
             'stderr': subprocess.PIPE,

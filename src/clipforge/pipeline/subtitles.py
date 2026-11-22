@@ -221,6 +221,7 @@ def build_ass(
     layout: str = 'face',
     offset_ms: int = 0,
     position: str = 'bottom',
+    y_pct: int | None = None,
 ):
     """Build a 1080x1920 pysubs2 SSAFile with dynamic Shorts/TikTok styling."""
     if style_name not in ASS_PRESETS:
@@ -238,7 +239,11 @@ def build_ass(
     subs.info['WrapStyle'] = '2'
     subs.info['ScaledBorderAndShadow'] = 'yes'
 
-    if position == 'top':
+    if y_pct is not None:
+        clamped_y = max(10, min(92, int(y_pct)))
+        alignment = pysubs2.Alignment.BOTTOM_CENTER
+        margin_v = max(80, min(1720, round(1920 * (100 - clamped_y) / 100.0)))
+    elif position == 'top':
         alignment = pysubs2.Alignment.TOP_CENTER
         margin_v = 680 if layout == 'split-cam' else 240
     elif position == 'middle':
@@ -298,8 +303,9 @@ def write_ass(
     layout: str = 'face',
     offset_ms: int = 0,
     position: str = 'bottom',
+    y_pct: int | None = None,
 ) -> Path:
     """Write a styled .ass subtitle file for the given clip-relative cues."""
-    subs = build_ass(cues, style_name, layout=layout, offset_ms=offset_ms, position=position)
+    subs = build_ass(cues, style_name, layout=layout, offset_ms=offset_ms, position=position, y_pct=y_pct)
     subs.save(str(destination), encoding='utf-8')
     return destination

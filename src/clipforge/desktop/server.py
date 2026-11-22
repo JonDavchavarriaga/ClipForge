@@ -142,13 +142,97 @@ class ClipForgeAppState:
                 break
         return items
 
+    def _processed_sources(self) -> set[str]:
+        seen: set[str] = set()
+        for root in self._batch_roots():
+            if not root.is_dir():
+                continue
+            for mf in root.glob('lote-*/manifest.json'):
+                try:
+                    data = json.loads(mf.read_text(encoding='utf-8'))
+                    src = data.get('source')
+                    if src:
+                        seen.add(str(Path(src).resolve()))
+                except (OSError, json.JSONDecodeError):
+                    continue
+        return seen
+
     def list_library(self) -> dict:
+        processed = self._processed_sources()
+        recs = self._scan_videos([self.workspace.live_recordings_dir], limit=40)
+        clips = self._scan_videos([self.workspace.live_clips_dir, self.legacy_sources_dir], limit=60)
+        sources = self._scan_videos([self.workspace.sources_dir], limit=40)
+        for group in (recs, clips, sources):
+            for item in group:
+                item['processed'] = item['path'] in processed
         return {
             'paths': self.workspace.to_dict(),
-            'live_recordings': self._scan_videos([self.workspace.live_recordings_dir], limit=30),
-            'live_clips': self._scan_videos([self.workspace.live_clips_dir, self.legacy_sources_dir], limit=50),
-            'sources': self._scan_videos([self.workspace.sources_dir], limit=40),
+            'live_recordings': recs,
+            'live_recordings_mb': round(sum(i['size_mb'] for i in recs), 2),
+            'live_clips': clips,
+            'live_clips_mb': round(sum(i['size_mb'] for i in clips), 2),
+            'sources': sources,
+            'sources_mb': round(sum(i['size_mb'] for i in sources), 2),
         }
+
+    def delete_library_item(self, raw_path: str) -> dict:
+        if not raw_path:
+            raise ValueError('Indica la ruta del archivo a borrar.')
+        target = Path(raw_path).resolve(strict=True)
+        allowed_roots = [
+            self.workspace.live_recordings_dir.resolve(),
+            self.workspace.live_clips_dir.resolve(),
+            self.workspace.sources_dir.resolve(),
+        ]
+        if self.legacy_sources_dir.is_dir():
+            allowed_roots.append(self.legacy_sources_dir.resolve())
+        if not any(target.is_relative_to(root) for root in allowed_roots):
+            raise ValueError('Solo se pueden borrar archivos dentro de la biblioteca local de Gevik Clip.')
+
+        live_status = self.recorder.status()
+        active_session = live_status.get('session_dir')
+        if live_status.get('running') and active_session:
+            active_dir = Path(active_session).resolve()
+            if target.is_relative_to(active_dir):
+                raise ValueError('Ese live se está grabando ahora mismo. Detén la grabación antes de borrarlo.')
+
+        freed_bytes = 0
+        rec_root = self.workspace.live_recordings_dir.resolve()
+        if target.is_relative_to(rec_root) and target.parent != rec_root and target.parent.parent == rec_root:
+            session_folder = target.parent
+            for p in session_folder.rglob('*'):
+                if p.is_file():
+                    try:
+                        freed_bytes += p.stat().st_size
+                    except OSError:
+                        pass
+            shutil.rmtree(session_folder)
+            deleted_target = str(session_folder)
+        else:
+            freed_bytes += target.stat().st_size if target.is_file() else 0
+            target.unlink(missing_ok=True)
+            for sidecar in (target.with_suffix('.json'), target.parent / 'clip.json'):
+                if sidecar.is_file() and sidecar.parent == target.parent:
+                    if sidecar.name == 'clip.json' and any(p.suffix.lower() in VIDEO_EXTS for p in target.parent.iterdir()):
+                        continue
+                    try:
+                        freed_bytes += sidecar.stat().st_size
+                        sidecar.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            # Clean empty subfolder inside live_clips or sources
+            for root in (self.workspace.live_clips_dir.resolve(), self.workspace.sources_dir.resolve()):
+                if target.parent.is_relative_to(root) and target.parent != root:
+                    try:
+                        if not any(target.parent.iterdir()):
+                            target.parent.rmdir()
+                    except OSError:
+                        pass
+            deleted_target = str(target)
+
+        freed_mb = round(freed_bytes / (1024 * 1024), 2)
+        log_event('library', 'item_deleted', {'target': deleted_target, 'freed_mb': freed_mb}, logs_dir=self.workspace.logs_dir)
+        return {'deleted': True, 'target': deleted_target, 'freed_mb': freed_mb}
 
     def list_sources(self) -> list[dict]:
         return self._scan_videos(
@@ -206,7 +290,9 @@ class ClipForgeAppState:
                     **clip,
                     'display_title': clip.get('display_title') or clip['id'],
                     'review_status': status,
+                    'cam_split_pct': int(clip.get('cam_split_pct', 33)),
                     'subtitle_position': clip.get('subtitle_position', 'bottom'),
+                    'subtitle_y_pct': clip.get('subtitle_y_pct'),
                     'subtitle_offset_ms': int(clip.get('subtitle_offset_ms', 0)),
                     'volume_db': float(clip.get('volume_db', 0.0)),
                     'denoise': bool(clip.get('denoise', True)),
@@ -649,6 +735,10 @@ def make_handler(state: ClipForgeAppState):
                         job_dict = job.to_dict()
                     self._send_json({'clip': vars(record), 'live': state.recorder.status(), 'job': job_dict})
                     return
+                if path == '/api/library/delete':
+                    result = state.delete_library_item(str(data.get('path') or '').strip())
+                    self._send_json(result)
+                    return
                 if path == '/api/open-folder':
                     key = str(data.get('folder') or 'root')
                     mapping = {
@@ -778,8 +868,10 @@ def make_handler(state: ClipForgeAppState):
                             end=float(data['end']) if data.get('end') not in (None, '') else None,
                             layout=str(data['layout']) if data.get('layout') else None,
                             cam_region_spec=str(data['cam_region']) if data.get('cam_region') else None,
+                            cam_split_pct=int(data['cam_split_pct']) if data.get('cam_split_pct') not in (None, '') else None,
                             caption_style=str(data['caption_style']) if data.get('caption_style') else None,
                             subtitle_position=str(data['subtitle_position']) if data.get('subtitle_position') else None,
+                            subtitle_y_pct=int(data['subtitle_y_pct']) if data.get('subtitle_y_pct') not in (None, '') else None,
                             subtitle_offset_ms=int(data['subtitle_offset_ms']) if data.get('subtitle_offset_ms') not in (None, '') else None,
                             denoise=bool(data['denoise']) if data.get('denoise') is not None else None,
                             volume_db=float(data['volume_db']) if data.get('volume_db') not in (None, '') else None,

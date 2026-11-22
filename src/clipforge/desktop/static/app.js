@@ -406,8 +406,21 @@ async function refreshStatus() {
     badges.innerHTML = `
       <span class="badge ${tr.claude?.available ? 'ok' : 'off'}">Claude ${tr.claude?.available ? 'OK' : 'N/D'}</span>
       <span class="badge ${tr.codex?.available ? 'ok' : 'off'}">Codex ${tr.codex?.available ? 'OK' : 'N/D'}</span>
-      <span class="badge ${tr.gemini?.available ? 'ok' : 'off'}">Gemini ${tr.gemini?.available ? 'OK' : 'Config'}</span>
+      <span class="badge ${tr.gemini?.available ? 'ok' : 'off'}">Gemini ${tr.gemini?.available ? 'OK' : 'Instalar CLI'}</span>
     `;
+    const engineSelect = document.getElementById('tr-engine');
+    if (engineSelect) {
+      Array.from(engineSelect.options).forEach((opt) => {
+        const info = tr[opt.value];
+        if (!info) return;
+        opt.textContent = info.available ? `${info.label} ✓` : `${info.label} (no instalado)`;
+      });
+      const currentOk = tr[engineSelect.value]?.available;
+      if (!currentOk) {
+        const firstReady = ['claude', 'codex', 'gemini'].find((k) => tr[k]?.available);
+        if (firstReady) engineSelect.value = firstReady;
+      }
+    }
     if (data.workspace?.root) {
       document.getElementById('workspace-root-path').textContent = `Carpeta local: ${data.workspace.root}`;
     }
@@ -448,11 +461,21 @@ async function refreshSources() {
   }
 }
 
+function formatSpace(mb) {
+  const n = Number(mb || 0);
+  return n >= 1024 ? `${(n / 1024).toFixed(2)} GB` : `${n.toFixed(1)} MB`;
+}
+
 async function refreshLibrary() {
   try {
     const lib = await api('/api/library');
     document.getElementById('workspace-root-path').textContent = `Carpeta local: ${lib.paths.root}`;
-    const renderList = (elId, items, emptyMsg) => {
+    const recSizeEl = document.getElementById('lib-rec-size');
+    const clipsSizeEl = document.getElementById('lib-clips-size');
+    if (recSizeEl) recSizeEl.textContent = formatSpace(lib.live_recordings_mb);
+    if (clipsSizeEl) clipsSizeEl.textContent = formatSpace(lib.live_clips_mb);
+
+    const renderList = (elId, items, emptyMsg, isFullRec) => {
       const el = document.getElementById(elId);
       if (!items.length) {
         el.innerHTML = `<div class="muted">${emptyMsg}</div>`;
@@ -462,25 +485,47 @@ async function refreshLibrary() {
       items.forEach((item) => {
         const row = document.createElement('div');
         row.className = 'list-item';
+        const procBadge = item.processed ? '<span class="badge ok">✓ Procesado</span>' : '';
         row.innerHTML = `
-          <div>
-            <strong>${esc(item.name)}</strong>
-            <div class="muted" style="font-size:11px;">${esc(item.relative)} · ${esc(item.size_mb)} MB</div>
+          <div style="min-width:0;flex:1;">
+            <strong style="word-break:break-word;">${esc(item.name)}</strong>
+            <div class="muted" style="font-size:11px;">${esc(item.relative)} · ${esc(formatSpace(item.size_mb))}</div>
           </div>
-          <span class="badge ok">Procesar →</span>
+          <div class="lib-actions">
+            ${procBadge}
+            <button type="button" class="btn btn-outline btn-compact lib-use-btn">Procesar →</button>
+            <button type="button" class="btn btn-danger btn-compact lib-del-btn" title="Borrar del disco para liberar espacio">🗑️</button>
+          </div>
         `;
-        row.addEventListener('click', () => {
+        row.querySelector('.lib-use-btn').addEventListener('click', (e) => {
+          e.stopPropagation();
           document.getElementById('proc-source').value = item.path;
           state.procCustomCam = '';
           document.getElementById('proc-preview-first').checked = item.name === 'full_recording.mp4' || item.size_mb > 45;
           switchTab('process');
           showToast(`Cargado ${item.name}`);
         });
+        row.querySelector('.lib-del-btn').addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const label = isFullRec ? `el live completo "${item.relative}" (${formatSpace(item.size_mb)})` : `"${item.name}" (${formatSpace(item.size_mb)})`;
+          if (!window.confirm(`¿Borrar definitivamente ${label} del disco para liberar espacio?`)) return;
+          try {
+            const res = await api('/api/library/delete', {
+              method: 'POST',
+              body: JSON.stringify({ path: item.path }),
+            });
+            showToast(`Eliminado · ${formatSpace(res.freed_mb)} liberados`);
+            refreshLibrary();
+            refreshSources();
+          } catch (err) {
+            showToast(err.message, true);
+          }
+        });
         el.appendChild(row);
       });
     };
-    renderList('lib-recordings', lib.live_recordings, 'Cuando detengas un live con "Guardar live completo", aparecerá aquí.');
-    renderList('lib-live-clips', lib.live_clips, 'Aún no hay clips en vivo guardados.');
+    renderList('lib-recordings', lib.live_recordings, 'Cuando detengas un live con "Guardar live completo", aparecerá aquí.', true);
+    renderList('lib-live-clips', lib.live_clips, 'Aún no hay clips en vivo guardados.', false);
   } catch (err) {
     showToast(err.message, true);
   }
@@ -624,7 +669,14 @@ async function loadSelectedClip() {
   document.getElementById('ed-start').value = Number(clip.start).toFixed(1);
   document.getElementById('ed-end').value = Number(clip.end).toFixed(1);
   document.getElementById('ed-layout').value = clip.layout || 'split-cam';
-  document.getElementById('ed-pos').value = clip.subtitle_position || 'bottom';
+  const defaultY = clip.subtitle_y_pct != null
+    ? Number(clip.subtitle_y_pct)
+    : (clip.subtitle_position === 'top' ? 18 : (clip.subtitle_position === 'middle' ? 54 : 80));
+  document.getElementById('ed-sub-y').value = String(defaultY);
+  document.getElementById('ed-sub-y-val').textContent = `${defaultY}%`;
+  const splitPct = Number(clip.cam_split_pct || 33);
+  document.getElementById('ed-split').value = String(splitPct);
+  document.getElementById('ed-split-val').textContent = `${splitPct}%`;
   document.getElementById('ed-offset').value = String(clip.subtitle_offset_ms || 0);
   document.getElementById('ed-offset-val').textContent = `${clip.subtitle_offset_ms || 0} ms`;
   document.getElementById('ed-vol').value = String(clip.volume_db || 0);
@@ -638,7 +690,40 @@ async function loadSelectedClip() {
   }
 }
 
+// Live guide overlay on 9:16 video player when positioning camera split or subtitles
+function showLayoutGuides() {
+  const overlay = document.getElementById('player-guide-overlay');
+  const camLine = document.getElementById('guide-line-cam');
+  const subLine = document.getElementById('guide-line-sub');
+  if (!overlay) return;
+  const layout = document.getElementById('ed-layout').value;
+  const splitPct = Number(document.getElementById('ed-split').value || 33);
+  const subY = Number(document.getElementById('ed-sub-y').value || 80);
+  camLine.style.display = layout === 'split-cam' ? 'flex' : 'none';
+  camLine.style.top = `${splitPct}%`;
+  subLine.style.top = `${subY}%`;
+  overlay.classList.remove('hidden');
+  clearTimeout(showLayoutGuides._t);
+  showLayoutGuides._t = setTimeout(() => overlay.classList.add('hidden'), 2600);
+}
+
 // Live slider labels in Mini-Editor
+document.getElementById('ed-sub-y').addEventListener('input', (e) => {
+  document.getElementById('ed-sub-y-val').textContent = `${e.target.value}%`;
+  showLayoutGuides();
+});
+document.querySelectorAll('.pos-preset-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.getElementById('ed-sub-y').value = btn.dataset.y;
+    document.getElementById('ed-sub-y-val').textContent = `${btn.dataset.y}%`;
+    showLayoutGuides();
+  });
+});
+document.getElementById('ed-split').addEventListener('input', (e) => {
+  document.getElementById('ed-split-val').textContent = `${e.target.value}%`;
+  document.getElementById('ed-layout').value = 'split-cam';
+  showLayoutGuides();
+});
 document.getElementById('ed-offset').addEventListener('input', (e) => {
   document.getElementById('ed-offset-val').textContent = `${e.target.value} ms`;
 });
@@ -822,8 +907,9 @@ document.getElementById('ed-apply-btn').addEventListener('click', async () => {
         end: Number(document.getElementById('ed-end').value),
         layout: document.getElementById('ed-layout').value,
         cam_region: state.edCustomCam || undefined,
+        cam_split_pct: Number(document.getElementById('ed-split').value),
         caption_style: document.getElementById('ed-caption-style').value,
-        subtitle_position: document.getElementById('ed-pos').value,
+        subtitle_y_pct: Number(document.getElementById('ed-sub-y').value),
         subtitle_offset_ms: Number(document.getElementById('ed-offset').value),
         volume_db: Number(document.getElementById('ed-vol').value),
         denoise: document.getElementById('ed-denoise').checked,
@@ -1132,15 +1218,9 @@ document.getElementById('pub-approve-btn').addEventListener('click', async () =>
   }
 });
 
-document.getElementById('pub-queue-btn').addEventListener('click', async () => {
-  if (!state.selectedBatchId) return showToast('Selecciona un proyecto.', true);
-  try {
-    const res = await api('/api/queue', { method: 'POST', body: JSON.stringify({ batch: state.selectedBatchId }) });
-    document.getElementById('pub-queue-result').textContent = res.message;
-    showToast('publicacion.csv exportado');
-  } catch (err) {
-    showToast(err.message, true);
-  }
+document.getElementById('pub-download-btn')?.addEventListener('click', () => {
+  if (!state.selectedBatchId || !state.selectedClipId) return showToast('Selecciona un clip.', true);
+  window.location.href = `/api/download?batch=${encodeURIComponent(state.selectedBatchId)}&clip=${encodeURIComponent(state.selectedClipId)}`;
 });
 
 // Folders & Full Clean Shutdown

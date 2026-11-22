@@ -69,8 +69,10 @@ def edit_clip(
     end: float | None = None,
     layout: str | None = None,
     cam_region_spec: str | None = None,
+    cam_split_pct: int | None = None,
     caption_style: str | None = None,
     subtitle_position: str | None = None,
+    subtitle_y_pct: int | None = None,
     subtitle_offset_ms: int | None = None,
     denoise: bool | None = None,
     volume_db: float | None = None,
@@ -96,14 +98,18 @@ def edit_clip(
         raise ValueError('El recorte IN/OUT debe durar al menos 1 segundo dentro del video.')
 
     use_layout = layout or clip.get('layout', 'split-cam')
+    use_split_pct = int(clip.get('cam_split_pct', 33) if cam_split_pct is None else cam_split_pct)
+    use_split_pct = max(20, min(55, use_split_pct))
     use_style = caption_style or clip.get('caption_style', 'highlight')
     if use_style not in CAPTION_STYLES:
         raise ValueError(f'Estilo de subtítulos inválido: {use_style}')
     use_pos = subtitle_position or clip.get('subtitle_position', 'bottom')
     if use_pos not in SUBTITLE_POSITIONS:
         use_pos = 'bottom'
+    raw_y_pct = clip.get('subtitle_y_pct') if subtitle_y_pct is None else subtitle_y_pct
+    use_y_pct = max(10, min(92, int(raw_y_pct))) if raw_y_pct is not None else None
     use_offset = int(clip.get('subtitle_offset_ms', 0) if subtitle_offset_ms is None else subtitle_offset_ms)
-    use_offset = max(-1500, min(1500, use_offset))
+    use_offset = max(-3000, min(3000, use_offset))
     use_denoise = bool(clip.get('denoise', True) if denoise is None else denoise)
     use_vol = float(clip.get('volume_db', 0.0) if volume_db is None else volume_db)
     use_vol = max(-12.0, min(12.0, use_vol))
@@ -168,6 +174,7 @@ def edit_clip(
                     layout=use_layout,
                     offset_ms=use_offset,
                     position=use_pos,
+                    y_pct=use_y_pct,
                 )
                 captions_file = out_ass
                 clip['captions_ass'] = f'{clip_id}/{out_ass.name}'
@@ -189,6 +196,7 @@ def edit_clip(
             use_denoise,
             captions_file=captions_file,
             cam_region=cam_region,
+            cam_split_pct=use_split_pct,
             volume_db=use_vol,
             cancel_event=cancel_event,
         )
@@ -199,11 +207,13 @@ def edit_clip(
     clip['start'] = round(new_start, 3)
     clip['end'] = round(new_end, 3)
     clip['layout'] = use_layout
+    clip['cam_split_pct'] = use_split_pct
     clip['cam_region'] = (
         {'x': cam_region.x, 'y': cam_region.y, 'w': cam_region.w, 'h': cam_region.h} if cam_region else None
     )
     clip['caption_style'] = use_style
     clip['subtitle_position'] = use_pos
+    clip['subtitle_y_pct'] = use_y_pct
     clip['subtitle_offset_ms'] = use_offset
     clip['denoise'] = use_denoise
     clip['volume_db'] = use_vol

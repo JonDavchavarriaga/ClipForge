@@ -21,7 +21,7 @@
 
       <nav class="nav">
         <button class="nav-btn active" data-tab="live">📺 Live y Auto-Clip</button>
-        <button class="nav-btn" data-tab="process">⚡ Generar Clips 9:16</button>
+        <button class="nav-btn" data-tab="process">⚡ Generar Clips</button>
         <button class="nav-btn" data-tab="review">🎬 Clips y Mini-Editor</button>
         <button class="nav-btn" data-tab="publish">🚀 Publicar</button>
         <button class="nav-btn" data-tab="library">📁 Biblioteca</button>
@@ -158,8 +158,8 @@
       <section id="tab-process" class="tab-panel">
         <header class="panel-header">
           <div>
-            <h2>⚡ Generar Clips Verticales (9:16)</h2>
-            <p class="muted">Calcula automáticamente cuántos clips sacar (saltando comerciales mudos), sincroniza subtítulos con precisión exacta por clip y valida tu cámara en el 1er clip.</p>
+            <h2>⚡ Generar Clips</h2>
+            <p class="muted">Detecta automáticamente los mejores momentos (saltando comerciales mudos), sincroniza subtítulos con precisión exacta y valida tu cámara en el 1er clip.</p>
           </div>
           <button id="refresh-sources-btn" class="btn btn-ghost">↻ Actualizar videos</button>
         </header>
@@ -265,7 +265,7 @@
             </details>
 
             <div class="actions">
-              <button id="proc-start-btn" class="btn btn-silver" style="width:100%;padding:12px;">⚡ Enviar a la Cola de Gevik Clip</button>
+              <button id="proc-start-btn" class="btn btn-silver" style="width:100%;padding:12px;">⚡ Generar Clips</button>
             </div>
           </div>
 
@@ -346,6 +346,10 @@
 
             <div class="preview-wrap">
               <video id="clip-player" controls playsinline></video>
+              <div id="player-guide-overlay" class="guide-overlay hidden">
+                <div id="guide-line-cam" class="guide-line guide-cam"><span>DIVISOR CÁMARA</span></div>
+                <div id="guide-line-sub" class="guide-line guide-sub"><span>SUBTÍTULOS AQUÍ</span></div>
+              </div>
             </div>
 
             <div class="quick-clip-actions">
@@ -360,8 +364,8 @@
           <div class="editor-stack">
             <!-- 1-CLICK NATURAL TRANSLATION -->
             <div class="card">
-              <h3>🌐 Traducción Natural en 1 Clic (IA Local)</h3>
-              <p class="muted" style="margin-bottom:10px;font-size:12px;">Traduce el clip completo en contexto usando tus herramientas locales sin editar frase por frase.</p>
+              <h3>🌐 Traducir Subtítulos en 1 Clic (IA de tu PC)</h3>
+              <p class="muted" style="margin-bottom:10px;font-size:12px;">Usa tus suscripciones locales (Claude Code / Codex / Gemini) <strong>solo para traducir los subtítulos</strong>. El audio original del video se mantiene 100% intacto.</p>
               <div class="row-3">
                 <div class="field">
                   <label for="tr-src">De</label>
@@ -433,28 +437,31 @@
 
               <div class="row-2">
                 <div class="field">
-                  <label for="ed-pos">Posición subtítulos</label>
-                  <select id="ed-pos">
-                    <option value="bottom" selected>Abajo (zona segura)</option>
-                    <option value="middle">Centro</option>
-                    <option value="top">Arriba</option>
-                  </select>
+                  <label for="ed-sub-y">Altura subtítulos: <strong id="ed-sub-y-val">80%</strong></label>
+                  <input id="ed-sub-y" type="range" min="12" max="90" step="2" value="80" />
+                  <div class="pos-presets">
+                    <button type="button" class="pos-preset-btn" data-y="18">Arriba</button>
+                    <button type="button" class="pos-preset-btn" data-y="38">Bajo cam</button>
+                    <button type="button" class="pos-preset-btn" data-y="54">Centro</button>
+                    <button type="button" class="pos-preset-btn" data-y="80">Abajo</button>
+                  </div>
                 </div>
                 <div class="field">
-                  <label for="ed-layout">Encuadre</label>
-                  <select id="ed-layout">
-                    <option value="split-cam">split-cam</option>
-                    <option value="face">face</option>
-                    <option value="fit">fit</option>
-                    <option value="center">center</option>
+                  <label for="ed-split">Tamaño cámara: <strong id="ed-split-val">33%</strong></label>
+                  <input id="ed-split" type="range" min="20" max="52" step="1" value="33" />
+                  <select id="ed-layout" style="margin-top:4px;">
+                    <option value="split-cam">split-cam (Cámara + Juego)</option>
+                    <option value="face">face (Solo cara)</option>
+                    <option value="fit">fit (Cuadro completo)</option>
+                    <option value="center">center (Centrado)</option>
                   </select>
                 </div>
               </div>
 
               <div class="row-2">
                 <div class="field">
-                  <label for="ed-offset">Sincronía fina: <strong id="ed-offset-val">0 ms</strong></label>
-                  <input id="ed-offset" type="range" min="-500" max="500" step="25" value="0" />
+                  <label for="ed-offset">Sincronía subtítulos: <strong id="ed-offset-val">0 ms</strong></label>
+                  <input id="ed-offset" type="range" min="-2000" max="2000" step="50" value="0" />
                 </div>
                 <div class="field">
                   <label for="ed-vol">Volumen: <strong id="ed-vol-val">0 dB</strong></label>
@@ -480,7 +487,7 @@
         <header class="panel-header">
           <div>
             <h2>🚀 Publicar (YouTube Shorts y TikTok)</h2>
-            <p class="muted">Aprueba con título y hashtags finales y exporta la cola `publicacion.csv`.</p>
+            <p class="muted">Guarda título y hashtags finales para tu clip y abre directamente YouTube Studio o TikTok Studio para subirlo.</p>
           </div>
         </header>
 
@@ -507,19 +514,18 @@
               <label class="checkbox-row"><input type="checkbox" class="pub-platform" value="facebook" /> Facebook</label>
             </div>
             <div class="actions">
-              <button id="pub-approve-btn" class="btn btn-silver">✅ Aprobar para publicar</button>
-              <button id="pub-queue-btn" class="btn btn-outline">📄 Exportar publicacion.csv</button>
+              <button id="pub-approve-btn" class="btn btn-silver">✅ Guardar y aprobar clip</button>
+              <button id="pub-download-btn" class="btn btn-outline">⬇️ Descargar MP4</button>
             </div>
           </div>
 
           <div class="card">
             <h3>Accesos rápidos</h3>
             <ul class="studio-links">
-              <li><a href="https://studio.youtube.com/" target="_blank" rel="noreferrer">YouTube Studio</a></li>
-              <li><a href="https://www.tiktok.com/tiktokstudio/upload" target="_blank" rel="noreferrer">TikTok Studio</a></li>
-              <li><a href="https://business.facebook.com/" target="_blank" rel="noreferrer">Meta Business Suite</a></li>
+              <li><a href="https://studio.youtube.com/" target="_blank" rel="noreferrer">YouTube Studio ↗</a></li>
+              <li><a href="https://www.tiktok.com/tiktokstudio/upload" target="_blank" rel="noreferrer">TikTok Studio ↗</a></li>
+              <li><a href="https://business.facebook.com/" target="_blank" rel="noreferrer">Meta Business Suite ↗</a></li>
             </ul>
-            <div id="pub-queue-result" class="hint"></div>
           </div>
         </div>
       </section>
@@ -545,11 +551,17 @@
 
         <div class="grid-2">
           <div class="card">
-            <h3>🎥 Grabaciones Completas de Lives (1h / 2h+)</h3>
+            <div class="card-head-row">
+              <h3>🎥 Lives Completos (1h / 2h+)</h3>
+              <span id="lib-rec-size" class="badge off">0 MB</span>
+            </div>
             <div id="lib-recordings" class="list-box tall"></div>
           </div>
           <div class="card">
-            <h3>⚡ Clips Sacados en Vivo (Auto / Manual)</h3>
+            <div class="card-head-row">
+              <h3>⚡ Clips en Vivo (Auto / Manual)</h3>
+              <span id="lib-clips-size" class="badge off">0 MB</span>
+            </div>
             <div id="lib-live-clips" class="list-box tall"></div>
           </div>
         </div>
