@@ -1,4 +1,4 @@
-"""Sequential FIFO processing queue with live stage/progress tracking and disk logging."""
+"""Sequential FIFO processing queue with live progress, cancellation, and idle RAM cleanup."""
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -10,6 +10,7 @@ from typing import Any, Callable
 import uuid
 
 from clipforge.logging_utils import log_event, log_info, record_error
+from clipforge.pipeline.media import unload_idle_whisper
 
 ProgressCallback = Callable[[str, int, str], None]
 
@@ -29,6 +30,7 @@ class Job:
     elapsed_seconds: float = 0.0
     result: Any = None
     error: str | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def to_dict(self, queue_position: int = 0) -> dict:
         elapsed = self.elapsed_seconds
@@ -52,18 +54,19 @@ class Job:
 
 
 class JobManager:
-    """Single-worker FIFO queue so heavy Whisper/FFmpeg tasks run cleanly in order."""
+    """Single-worker FIFO queue so heavy Whisper/FFmpeg tasks run cleanly in order with cancel support."""
 
     def __init__(self, logs_dir: Path | None = None):
         self._lock = threading.RLock()
         self._jobs: dict[str, Job] = {}
         self._pending_order: list[str] = []
-        self._queue: queue.Queue[tuple[str, Callable[[ProgressCallback], Any]]] = queue.Queue()
+        self._active_job_id: str | None = None
+        self._queue: queue.Queue[tuple[str, Callable]] = queue.Queue()
         self._logs_dir = logs_dir
-        self._worker = threading.Thread(target=self._worker_loop, name='clipforge-queue', daemon=True)
+        self._worker = threading.Thread(target=self._worker_loop, name='gevik-queue', daemon=True)
         self._worker.start()
 
-    def submit(self, kind: str, label: str, fn: Callable[[ProgressCallback], Any]) -> Job:
+    def submit(self, kind: str, label: str, fn: Callable) -> Job:
         job_id = uuid.uuid4().hex[:10]
         job = Job(id=job_id, kind=kind, label=label)
         with self._lock:
@@ -74,16 +77,56 @@ class JobManager:
         self._queue.put((job_id, fn))
         return job
 
+    def cancel(self, job_id: str | None = None) -> dict:
+        """Cancel a specific job (or the currently active job if job_id is omitted)."""
+        with self._lock:
+            target_id = job_id or self._active_job_id
+            if not target_id or target_id not in self._jobs:
+                return {'cancelled': False}
+            job = self._jobs[target_id]
+            job.cancel_event.set()
+            if job.status == 'queued':
+                if target_id in self._pending_order:
+                    self._pending_order.remove(target_id)
+                job.status = 'cancelled'
+                job.stage = 'Cancelado'
+                job.detail = 'Cancelado antes de iniciar'
+                job.finished_at = datetime.now(timezone.utc).isoformat()
+            elif job.status == 'running':
+                job.stage = 'Cancelando...'
+                job.detail = 'Deteniendo proceso en curso...'
+        log_event('queue', 'job_cancel_requested', {'job_id': target_id}, logs_dir=self._logs_dir)
+        return {'cancelled': True, 'job_id': target_id}
+
+    def cancel_all(self):
+        with self._lock:
+            for job in self._jobs.values():
+                if job.status in {'queued', 'running'}:
+                    job.cancel_event.set()
+                    if job.status == 'queued':
+                        job.status = 'cancelled'
+                        job.stage = 'Cancelado'
+                        job.finished_at = datetime.now(timezone.utc).isoformat()
+            self._pending_order.clear()
+
     def _worker_loop(self):
         while True:
-            job_id, fn = self._queue.get()
+            try:
+                job_id, fn = self._queue.get(timeout=15.0)
+            except queue.Empty:
+                unload_idle_whisper()
+                continue
+
             with self._lock:
                 job = self._jobs.get(job_id)
-                if job is None:
+                if job is None or job.cancel_event.is_set() or job.status == 'cancelled':
+                    if job_id in self._pending_order:
+                        self._pending_order.remove(job_id)
                     self._queue.task_done()
                     continue
                 if job_id in self._pending_order:
                     self._pending_order.remove(job_id)
+                self._active_job_id = job_id
                 job.status = 'running'
                 job.stage = 'Iniciando'
                 job.percent = 2
@@ -94,13 +137,17 @@ class JobManager:
 
             def update_progress(stage: str, percent: int, detail: str):
                 with self._lock:
-                    job.stage = stage
-                    job.percent = max(0, min(100, int(percent)))
-                    job.detail = detail
+                    if not job.cancel_event.is_set():
+                        job.stage = stage
+                        job.percent = max(0, min(100, int(percent)))
+                        job.detail = detail
                 log_info(f'queue.{job.kind}.{job_id}', f'{stage} ({percent}%): {detail}', self._logs_dir)
 
             try:
-                output = fn(update_progress)
+                # Support both fn(progress) and fn(progress, cancel_event)
+                import inspect
+                params = len(inspect.signature(fn).parameters)
+                output = fn(update_progress, job.cancel_event) if params >= 2 else fn(update_progress)
                 with self._lock:
                     job.result = output
                     job.status = 'done'
@@ -116,6 +163,14 @@ class JobManager:
                     'elapsed_seconds': job.elapsed_seconds,
                     'result': output if isinstance(output, (dict, str, int, float, bool)) else str(output),
                 }, logs_dir=self._logs_dir)
+            except InterruptedError:
+                with self._lock:
+                    job.status = 'cancelled'
+                    job.stage = 'Cancelado'
+                    job.detail = 'Cancelado por el usuario'
+                    job.elapsed_seconds = round(time.monotonic() - (job.started_monotonic or time.monotonic()), 1)
+                    job.finished_at = datetime.now(timezone.utc).isoformat()
+                log_event('queue', 'job_cancelled', {'job_id': job_id, 'label': job.label}, logs_dir=self._logs_dir)
             except Exception as exc:
                 record_error(
                     f'job.{job.kind}',
@@ -131,6 +186,9 @@ class JobManager:
                     job.elapsed_seconds = round(time.monotonic() - (job.started_monotonic or time.monotonic()), 1)
                     job.finished_at = datetime.now(timezone.utc).isoformat()
             finally:
+                with self._lock:
+                    if self._active_job_id == job_id:
+                        self._active_job_id = None
                 self._queue.task_done()
 
     def get(self, job_id: str) -> dict | None:

@@ -1,5 +1,5 @@
 param(
-    [string]$ShortcutName = "ClipForge",
+    [string]$ShortcutName = "Gevik Clip",
     [string]$IconPath = ""
 )
 
@@ -11,9 +11,9 @@ $VenvPythonW = Join-Path $ProjectRoot ".venv\Scripts\pythonw.exe"
 $PythonConsole = if (Test-Path $VenvPython) { $VenvPython } else { (Get-Command python).Source }
 $LauncherExe = if (Test-Path $VenvPythonW) { $VenvPythonW } else { $PythonConsole }
 
-$DefaultIco = Join-Path $ProjectRoot "assets\icons\clipforge.ico"
-if (-not $IconPath -and -not (Test-Path $DefaultIco)) {
-    & $PythonConsole -c "import sys; sys.path.insert(0, 'src'); from pathlib import Path; from clipforge.desktop.icon import generate_ico; generate_ico(Path('assets/icons/clipforge.ico'))"
+$DefaultIco = Join-Path $ProjectRoot "assets\icons\gevik-clip.ico"
+if (-not $IconPath) {
+    & $PythonConsole -c "import sys; sys.path.insert(0, 'src'); from pathlib import Path; from clipforge.desktop.icon import generate_ico; generate_ico(Path('assets/icons/gevik-clip.ico'))"
 }
 
 $DesktopPath = [Environment]::GetFolderPath("Desktop")
@@ -24,7 +24,7 @@ $Shortcut = $WshShell.CreateShortcut($ShortcutFile)
 $Shortcut.TargetPath = $LauncherExe
 $Shortcut.Arguments = "clipforge.py app"
 $Shortcut.WorkingDirectory = $ProjectRoot
-$Shortcut.Description = "ClipForge Studio - Live Clipper, 9:16 Split-Cam y Subtítulos Bilingües EN/ES"
+$Shortcut.Description = "Gevik Clip - Live Clipper, Mini-Editor 9:16 y Traducción IA"
 
 if ($IconPath -and (Test-Path $IconPath)) {
     $Shortcut.IconLocation = (Resolve-Path $IconPath).Path

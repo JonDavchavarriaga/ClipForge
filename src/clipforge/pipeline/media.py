@@ -5,6 +5,7 @@ import shutil
 from statistics import median
 import subprocess
 import sys
+import threading
 import time
 import wave
 from array import array
@@ -13,8 +14,16 @@ from pathlib import Path
 
 from clipforge.logging_utils import ensure_safe_stdio
 from clipforge.pipeline.highlights import Cue, WordTiming
+from clipforge.process_manager import BACKGROUND_FLAGS, CREATE_NO_WINDOW, REGISTRY
 
-NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+NO_WINDOW_FLAGS = CREATE_NO_WINDOW
+
+# Idle-unloading cache for WhisperModel so clip-level alignment is fast without hogging RAM
+_MODEL_LOCK = threading.RLock()
+_CACHED_MODEL_NAME: str | None = None
+_CACHED_MODEL = None
+_MODEL_LAST_USED: float = 0.0
+_MODEL_IDLE_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -75,21 +84,23 @@ def ffmpeg():
     return get_ffmpeg_exe()
 
 
-def run(args, cwd=None):
-    result = subprocess.run(
-        [ffmpeg(), '-nostdin', '-hide_banner', '-loglevel', 'error', *map(str, args)],
-        cwd=cwd, capture_output=True, text=True, encoding='utf-8', errors='replace',
-        creationflags=NO_WINDOW_FLAGS,
-    )
+def _ffmpeg_threads() -> str:
+    cpus = os.cpu_count() or 4
+    return str(max(2, min(4, cpus - 1)))
+
+
+def run(args, cwd=None, *, cancel_event: threading.Event | None = None):
+    cmd = [ffmpeg(), '-nostdin', '-hide_banner', '-loglevel', 'error', *map(str, args)]
+    result = REGISTRY.run_managed(cmd, cwd=cwd, cancel_event=cancel_event, low_priority=True)
     if result.returncode:
-        raise ValueError(f'FFmpeg: {result.stderr.strip()}')
+        raise ValueError(f'FFmpeg: {(result.stderr or "").strip()}')
 
 
 def probe(path):
     result = subprocess.run(
         [ffmpeg(), '-nostdin', '-hide_banner', '-i', str(path)],
         capture_output=True, text=True, encoding='utf-8', errors='replace',
-        creationflags=NO_WINDOW_FLAGS,
+        creationflags=BACKGROUND_FLAGS,
     )
     info = result.stderr
     duration = re.search(r'Duration:\s+(\d+):(\d+):([\d.]+)', info)
@@ -102,8 +113,19 @@ def probe(path):
     return Media(3600 * hours + 60 * minutes + secs, len(re.findall(r'Stream .*Audio:', info)), width, height)
 
 
-def audio_preview(source, output, track):
-    run(['-i', source, '-map', f'0:a:{track}', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', output])
+def _hybrid_seek_args(source: Path, start: float, duration: float) -> list[str]:
+    """Fast-seek 2s before target then frame-accurately seek the final delta so PTS aligns cleanly."""
+    safe_start = max(0.0, float(start))
+    if safe_start > 2.5:
+        pre = safe_start - 2.0
+        fine = 2.0
+        return ['-fflags', '+genpts', '-ss', f'{pre:.6f}', '-i', str(source), '-ss', f'{fine:.6f}', '-t', f'{duration:.6f}']
+    return ['-fflags', '+genpts', '-i', str(source), '-ss', f'{safe_start:.6f}', '-t', f'{duration:.6f}']
+
+
+def audio_preview(source, output, track, *, cancel_event: threading.Event | None = None):
+    run(['-i', source, '-map', f'0:a:{track}', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', '-y', output],
+        cancel_event=cancel_event)
     energy = []
     with wave.open(str(output), 'rb') as wav:
         while block := wav.readframes(16000):
@@ -113,11 +135,25 @@ def audio_preview(source, output, track):
     return energy
 
 
-def load_wav_float32(path: Path):
-    """Read a 16kHz mono 16-bit PCM WAV into a 1D float32 numpy array for faster-whisper.
+def extract_clip_wav(source: Path, start: float, end: float, output_wav: Path, track: int, *, cancel_event=None) -> Path:
+    """Extract clip-exact 16kHz mono PCM WAV using identical hybrid seek as render() for zero subtitle drift."""
+    duration = max(0.5, float(end) - float(start))
+    args = [
+        *_hybrid_seek_args(Path(source), start, duration),
+        '-map', f'0:a:{track}',
+        '-af', 'asetpts=PTS-STARTPTS',
+        '-ac', '1',
+        '-ar', '16000',
+        '-c:a', 'pcm_s16le',
+        '-y',
+        output_wav,
+    ]
+    run(args, cancel_event=cancel_event)
+    return output_wav
 
-    Bypasses PyAV (`av.open(..., metadata_errors=...)`) incompatibilities across PyAV versions.
-    """
+
+def load_wav_float32(path: Path):
+    """Read a 16kHz mono 16-bit PCM WAV into a 1D float32 numpy array for faster-whisper."""
     import numpy as np
 
     with wave.open(str(path), 'rb') as wav:
@@ -129,16 +165,34 @@ def load_wav_float32(path: Path):
     return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def speech(path, model_name, language):
-    ensure_safe_stdio()
+def unload_idle_whisper():
+    global _CACHED_MODEL, _CACHED_MODEL_NAME
+    with _MODEL_LOCK:
+        if _CACHED_MODEL is not None and (time.monotonic() - _MODEL_LAST_USED) >= _MODEL_IDLE_SECONDS:
+            _CACHED_MODEL = None
+            _CACHED_MODEL_NAME = None
+
+
+def _get_whisper_model(model_name: str):
+    global _CACHED_MODEL, _CACHED_MODEL_NAME, _MODEL_LAST_USED
     try:
         from faster_whisper import WhisperModel
     except ImportError as error:
         raise ValueError('Instala requirements.txt para transcribir con faster-whisper.') from error
+    with _MODEL_LOCK:
+        if _CACHED_MODEL is None or _CACHED_MODEL_NAME != model_name:
+            _CACHED_MODEL = WhisperModel(model_name, device='cpu', compute_type='int8', cpu_threads=int(_ffmpeg_threads()))
+            _CACHED_MODEL_NAME = model_name
+        _MODEL_LAST_USED = time.monotonic()
+        return _CACHED_MODEL
+
+
+def speech(path, model_name, language):
+    ensure_safe_stdio()
     audio = load_wav_float32(Path(path))
     if audio.size == 0:
         return []
-    model = WhisperModel(model_name, device='cpu', compute_type='int8')
+    model = _get_whisper_model(model_name)
     segments, _ = model.transcribe(
         audio, language=None if language == 'auto' else language,
         word_timestamps=True, vad_filter=True, condition_on_previous_text=False,
@@ -148,8 +202,8 @@ def speech(path, model_name, language):
     for segment in segments:
         group = []
         for word in segment.words or []:
-            if group and (len(group) >= 7 or word.end - group[0].start > 2.7
-                          or len(''.join(item.word for item in group) + word.word) > 44):
+            if group and (len(group) >= 6 or word.end - group[0].start > 2.4
+                          or len(''.join(item.word for item in group) + word.word) > 38):
                 timings = tuple(
                     WordTiming(item.start, item.end, item.word.strip())
                     for item in group
@@ -309,11 +363,46 @@ def extract_frame_jpg(source: Path, timestamp_sec: float, destination: Path) -> 
     return destination
 
 
-def render(source, target, start, end, track, layout, has_captions, denoise, *, captions_file=None, cam_region=None):
+def generate_thumbnail(video_path: Path, destination: Path) -> Path | None:
+    """Create a lightweight vertical thumbnail JPEG (360px wide) for the clip manager."""
+    try:
+        info = probe(video_path)
+        ts = min(max(0.2, info.duration * 0.2), max(0.0, info.duration - 0.1))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        run([
+            '-ss', f'{ts:.3f}',
+            '-i', video_path,
+            '-frames:v', '1',
+            '-vf', 'scale=360:-2',
+            '-q:v', '4',
+            '-y',
+            destination,
+        ])
+        return destination if destination.is_file() else None
+    except Exception:
+        return None
+
+
+def render(
+    source,
+    target,
+    start,
+    end,
+    track,
+    layout,
+    has_captions,
+    denoise,
+    *,
+    captions_file=None,
+    cam_region=None,
+    volume_db: float = 0.0,
+    cancel_event: threading.Event | None = None,
+):
     target = Path(target)
     temp_target = target.with_name(f'.tmp-{target.name}')
     caption_step = _caption_filter(has_captions, captions_file)
-    args = ['-ss', f'{start:.6f}', '-i', source, '-t', f'{end - start:.6f}']
+    duration = max(0.5, float(end) - float(start))
+    args = [*_hybrid_seek_args(Path(source), start, duration)]
 
     if layout == 'split-cam':
         region = cam_region or CAM_PRESETS['bottom-right']
@@ -327,14 +416,14 @@ def render(source, target, start, end, track, layout, has_captions, denoise, *, 
         if caption_step:
             post_steps.append(caption_step)
         graph = (
-            '[0:v:0]scale=trunc(iw*sar/2)*2:ih,setsar=1,fps=30,split=2[vcam][vgame];'
+            '[0:v:0]setpts=PTS-STARTPTS,scale=trunc(iw*sar/2)*2:ih,setsar=1,fps=30,split=2[vcam][vgame];'
             f'[vcam]{top_crop},scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[top];'
             '[vgame]scale=1080:1280:force_original_aspect_ratio=increase,crop=1080:1280[bottom];'
             f'[top][bottom]{",".join(post_steps)}[vout]'
         )
         args.extend(['-filter_complex', graph, '-map', '[vout]'])
     else:
-        filters = ['scale=trunc(iw*sar/2)*2:ih', 'setsar=1', 'fps=30']
+        filters = ['setpts=PTS-STARTPTS', 'scale=trunc(iw*sar/2)*2:ih', 'setsar=1', 'fps=30']
         if layout == 'fit':
             filters.extend([
                 'scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2',
@@ -352,16 +441,26 @@ def render(source, target, start, end, track, layout, has_captions, denoise, *, 
         args.extend(['-map', '0:v:0', '-vf', ','.join(filters)])
 
     if track is not None:
-        effects = ['highpass=f=65']
+        effects = ['asetpts=PTS-STARTPTS', 'highpass=f=65']
         if denoise:
             effects.append('afftdn=nr=10')
         effects.append('loudnorm=I=-16:TP=-1.5:LRA=11')
+        if abs(volume_db) >= 0.2:
+            effects.append(f'volume={volume_db:.1f}dB')
         args.extend(['-map', f'0:a:{track}', '-af', ','.join(effects), '-c:a', 'aac', '-b:a', '160k', '-ar', '48000'])
 
-    args.extend(['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast',
-                 '-crf', '21', '-movflags', '+faststart', '-y', temp_target])
+    args.extend([
+        '-threads', _ffmpeg_threads(),
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-preset', 'veryfast',
+        '-crf', '21',
+        '-movflags', '+faststart',
+        '-y',
+        temp_target,
+    ])
     try:
-        run(args, cwd=target.parent)
+        run(args, cwd=target.parent, cancel_event=cancel_event)
         for attempt in range(6):
             try:
                 temp_target.replace(target)

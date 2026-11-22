@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="obsidian" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#171A21"/>
+      <stop offset="50%" stop-color="#0B0D11"/>
+      <stop offset="100%" stop-color="#050608"/>
+    </linearGradient>
+    <linearGradient id="silver" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="45%" stop-color="#D4DBE4"/>
+      <stop offset="100%" stop-color="#7B8797"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E2E8F0"/>
+      <stop offset="50%" stop-color="#64748B"/>
+      <stop offset="100%" stop-color="#CBD5E1"/>
+    </linearGradient>
+  </defs>
+  <!-- Obsidian rounded squircle -->
+  <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#obsidian)" stroke="url(#rim)" stroke-width="7"/>
+  <!-- Inner subtle bevel -->
+  <rect x="24" y="24" width="208" height="208" rx="44" fill="none" stroke="#262C36" stroke-width="2"/>
+  <!-- Bold geometric metallic silver G monogram -->
+  <path d="M 176 92 A 64 64 0 1 0 186 154 L 186 126 L 128 126 L 128 150 L 160 150 A 38 38 0 1 1 154 104 Z" fill="url(#silver)"/>
+  <!-- Minimalist clip/play cut accent on right bar -->
+  <polygon points="196,62 212,72 196,82" fill="url(#silver)"/>
+</svg>

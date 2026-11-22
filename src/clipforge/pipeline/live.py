@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 
 from clipforge.logging_utils import log_event, log_info, record_error
 from clipforge.pipeline.media import NO_WINDOW_FLAGS, ffmpeg, run as run_ffmpeg
+from clipforge.process_manager import BACKGROUND_FLAGS, REGISTRY
 from clipforge.publishing.publication import save_json
 
 SENSITIVITY_DB = {
@@ -339,15 +340,15 @@ class LiveRecorder:
             self._last_error = ''
             self._full_recording_path = ''
             self._last_db = -60.0
-            self._process = subprocess.Popen(
+            self._process = REGISTRY.register(subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                creationflags=NO_WINDOW_FLAGS,
-            )
+                creationflags=BACKGROUND_FLAGS,
+            ))
             self._buffer_dir = buffer_dir
             self._session_dir = session_dir
             self._started_at = time.monotonic()
@@ -575,13 +576,8 @@ class LiveRecorder:
         with self._lock:
             self._stop_event.set()
             proc = self._process
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=3)
+            if proc is not None:
+                REGISTRY.terminate_proc(proc)
             self._process = None
 
             # Assemble full 1h-2h recording into full_recording.mp4 if enabled

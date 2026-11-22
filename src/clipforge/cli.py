@@ -28,7 +28,9 @@ from clipforge.pipeline.media import (
     CamRegion,
     audio_preview,
     detect_cam_region,
+    extract_clip_wav,
     face_commands,
+    generate_thumbnail,
     parse_cam_region,
     probe,
     render,
@@ -140,6 +142,18 @@ def _deserialize_cues(raw_cues: list[dict]) -> list[Cue]:
     return items
 
 
+def _human_batch_name(source: Path) -> str:
+    """Create a readable project name instead of cryptic lote-xxxx IDs."""
+    stamp = datetime.now().strftime('%d %b %H:%M')
+    parent = source.parent.name
+    if source.name == 'full_recording.mp4' and '-' in parent:
+        parts = parent.split('-')
+        if len(parts) >= 2:
+            return f'{parts[0].title()} · {parts[1]} · {stamp}'
+    stem = re.sub(r'^\d{8}-\d{6}-', '', source.stem)
+    return f'{stem[:36]} · {stamp}'
+
+
 def _render_single_candidate(
     source: Path,
     folder: Path,
@@ -151,6 +165,11 @@ def _render_single_candidate(
     requested_cam: CamRegion | None,
     caption_style: str,
     denoise: bool,
+    *,
+    align_model: str | None = None,
+    align_language: str = 'auto',
+    reuse_existing_srt: bool = False,
+    cancel_event=None,
 ) -> dict:
     clip_id = f'clip-{index:02}'
     clip_dir = folder / clip_id
@@ -164,11 +183,26 @@ def _render_single_candidate(
     elif layout == 'split-cam':
         cam_region = requested_cam or detect_cam_region(source, candidate.start, candidate.end - candidate.start)
 
-    rebased = clip_cues(cues, candidate.start, candidate.end)
-    captions_srt = make_srt(cues, candidate.start, candidate.end)
+    # Zero-drift exact clip alignment: preserve existing exact SRT on camera retest or transcribe cut WAV
+    rebased: list[Cue]
+    existing_srt = clip_dir / 'captions.srt'
+    if reuse_existing_srt and existing_srt.is_file():
+        rebased = read_srt(existing_srt)
+    elif align_model and track is not None:
+        clip_wav = clip_dir / '_align.wav'
+        try:
+            extract_clip_wav(source, candidate.start, candidate.end, clip_wav, track, cancel_event=cancel_event)
+            aligned = speech(clip_wav, align_model, align_language)
+            rebased = aligned if aligned else clip_cues(cues, candidate.start, candidate.end)
+        finally:
+            clip_wav.unlink(missing_ok=True)
+    else:
+        rebased = clip_cues(cues, candidate.start, candidate.end)
+
+    captions_srt = make_srt(rebased, 0.0, max(0.5, candidate.end - candidate.start)) if rebased else ''
     captions_file = None
     captions_ass_rel = None
-    if captions_srt:
+    if captions_srt and caption_style != 'none':
         srt_target = clip_dir / 'captions.srt'
         srt_target.write_text(captions_srt, encoding='utf-8')
         captions_file = srt_target
@@ -177,6 +211,8 @@ def _render_single_candidate(
             write_ass(rebased, ass_target, caption_style, layout=layout)
             captions_file = ass_target
             captions_ass_rel = f'{clip_id}/captions.ass'
+    elif captions_srt:
+        (clip_dir / 'captions.srt').write_text(captions_srt, encoding='utf-8')
 
     target = clip_dir / 'video.mp4'
     t0 = time.monotonic()
@@ -188,14 +224,17 @@ def _render_single_candidate(
             candidate.end,
             track,
             layout,
-            bool(captions_srt),
+            captions_file is not None,
             denoise,
             captions_file=captions_file,
             cam_region=cam_region,
+            cancel_event=cancel_event,
         )
     finally:
         (clip_dir / 'follow.txt').unlink(missing_ok=True)
 
+    thumb = generate_thumbnail(target, clip_dir / 'thumb.jpg')
+    hook_title = rebased[0].text.strip()[:52] if rebased else f'Clip {index:02}'
     render_secs = round(time.monotonic() - t0, 2)
     size_mb = round(target.stat().st_size / (1024 * 1024), 2) if target.is_file() else 0.0
     log_event('pipeline.render', 'clip_rendered', {
@@ -206,11 +245,14 @@ def _render_single_candidate(
         'layout': layout,
         'cam_region': _serialize_cam(cam_region),
         'caption_style': caption_style,
+        'exact_aligned': bool(align_model),
         'render_seconds': render_secs,
         'size_mb': size_mb,
     })
     return {
         'id': clip_id,
+        'display_title': hook_title,
+        'review_status': 'pending',
         'start': round(candidate.start, 3),
         'end': round(candidate.end, 3),
         'score': round(candidate.score, 3) if candidate.score is not None else None,
@@ -218,13 +260,18 @@ def _render_single_candidate(
         'layout': layout,
         'cam_region': _serialize_cam(cam_region),
         'caption_style': caption_style,
+        'subtitle_position': 'bottom',
+        'subtitle_offset_ms': 0,
+        'denoise': denoise,
+        'volume_db': 0.0,
         'video': f'{clip_id}/video.mp4',
+        'thumb': f'{clip_id}/thumb.jpg' if thumb else None,
         'captions': f'{clip_id}/captions.srt' if captions_srt else None,
         'captions_ass': captions_ass_rel,
     }
 
 
-def process(args, *, progress_cb: ProgressFn | None = None):
+def process(args, *, progress_cb: ProgressFn | None = None, cancel_event=None):
     rights = provenance(args)
     source = args.source.resolve(strict=True)
     _emit(progress_cb, 'Analizando video', 5, f'Inspeccionando {source.name}...')
@@ -258,7 +305,7 @@ def process(args, *, progress_cb: ProgressFn | None = None):
                 wav = Path(directory) / 'voz.wav'
                 _emit(progress_cb, 'Analizando audio', 15, 'Extrayendo audio y detectando comerciales/silencios...')
                 print('Analizando audio…', flush=True)
-                energy = audio_preview(source, wav, track)
+                energy = audio_preview(source, wav, track, cancel_event=cancel_event)
                 muted_ranges = detect_muted_ranges(energy)
                 if muted_ranges:
                     muted_secs = round(sum(end - start for start, end in muted_ranges), 1)
@@ -304,6 +351,7 @@ def process(args, *, progress_cb: ProgressFn | None = None):
 
             # Always persist plan.json so preview-first batches can finish clips 2..N without re-running Whisper
             plan_data = {
+                'display_name': _human_batch_name(source),
                 'source': str(source),
                 'rights': rights,
                 'audio_track': track,
@@ -311,6 +359,8 @@ def process(args, *, progress_cb: ProgressFn | None = None):
                 'layout': args.layout,
                 'cam_region_spec': args.cam_region,
                 'caption_style': args.caption_style,
+                'model': args.model if needs_asr else '',
+                'language': args.language,
                 'denoise': bool(args.denoise),
                 'muted_ranges': [[round(s, 2), round(e, 2)] for s, e in muted_ranges],
                 'candidates': [
@@ -330,12 +380,14 @@ def process(args, *, progress_cb: ProgressFn | None = None):
             render_candidates = candidates[:1] if (preview_first and len(candidates) > 1) else candidates
             total_to_render = len(render_candidates)
             for idx, candidate in enumerate(render_candidates, 1):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError('Tarea cancelada por el usuario.')
                 pct = 60 + int((idx - 1) / max(1, total_to_render) * 35)
                 _emit(
                     progress_cb,
                     'Renderizando',
                     pct,
-                    f'Renderizando clip {idx} de {total_to_render} ({candidate.start:.0f}s–{candidate.end:.0f}s)...',
+                    f'Sincronizando y renderizando clip {idx} de {total_to_render}...',
                 )
                 print(f'clip-{idx:02} · {candidate.start:.1f}s–{candidate.end:.1f}s · {args.layout} · {args.caption_style}', flush=True)
                 clip_entry = _render_single_candidate(
@@ -349,6 +401,9 @@ def process(args, *, progress_cb: ProgressFn | None = None):
                     requested_cam,
                     args.caption_style,
                     bool(args.denoise),
+                    align_model=args.model if needs_asr else None,
+                    align_language=args.language,
+                    cancel_event=cancel_event,
                 )
                 clips.append(clip_entry)
 
@@ -356,9 +411,11 @@ def process(args, *, progress_cb: ProgressFn | None = None):
         save_json(
             folder / 'manifest.json',
             {
+                'display_name': plan_data['display_name'],
                 'source': str(source),
                 'rights': rights,
                 'audio_track': track,
+                'duration': round(info.duration, 3),
                 'status': 'awaiting_preview_approval' if awaiting else 'complete',
                 'planned_total': len(candidates),
                 'remaining_count': max(0, len(candidates) - len(clips)),
@@ -390,6 +447,7 @@ def retest_preview_clip(
     caption_style: str | None = None,
     denoise: bool | None = None,
     progress_cb: ProgressFn | None = None,
+    cancel_event=None,
 ) -> dict:
     """Re-render only clip-01 from plan.json so the user can calibrate the webcam box quickly."""
     folder = folder.resolve(strict=True)
@@ -418,6 +476,8 @@ def retest_preview_clip(
         requested_cam,
         use_style,
         use_denoise,
+        reuse_existing_srt=True,
+        cancel_event=cancel_event,
     )
     plan['layout'] = use_layout
     plan['cam_region_spec'] = use_cam_spec
@@ -440,8 +500,9 @@ def continue_batch(
     caption_style: str | None = None,
     denoise: bool | None = None,
     progress_cb: ProgressFn | None = None,
+    cancel_event=None,
 ) -> dict:
-    """Render remaining planned clips (clip-02..N) using cached cues & approved camera region."""
+    """Render remaining planned clips (clip-02..N) using exact per-clip sync & approved camera region."""
     folder = folder.resolve(strict=True)
     plan_path = folder / 'plan.json'
     if not plan_path.is_file():
@@ -455,6 +516,8 @@ def continue_batch(
     use_layout = layout or plan.get('layout', 'split-cam')
     use_style = caption_style or plan.get('caption_style', 'highlight')
     use_denoise = plan.get('denoise', True) if denoise is None else bool(denoise)
+    align_model = plan.get('model') or None
+    align_language = plan.get('language') or 'auto'
 
     requested_cam: CamRegion | None = None
     if use_layout == 'split-cam':
@@ -463,7 +526,6 @@ def continue_batch(
         elif plan.get('approved_cam_region'):
             requested_cam = _deserialize_cam(plan['approved_cam_region'])
         elif manifest.get('clips') and manifest['clips'][0].get('cam_region'):
-            # Reuse the exact camera box approved on clip-01 across the whole stream!
             requested_cam = _deserialize_cam(manifest['clips'][0]['cam_region'])
 
     pending = [c for c in plan.get('candidates', []) if f'clip-{int(c["index"]):02}' not in existing_ids]
@@ -476,10 +538,12 @@ def continue_batch(
 
     clips = list(manifest.get('clips', []))
     for pos, item in enumerate(pending, 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError('Tarea cancelada por el usuario.')
         idx = int(item['index'])
         candidate = Candidate(item['start'], item['end'], item.get('score'), item.get('reason', ''))
         pct = int((pos - 1) / max(1, total) * 90) + 5
-        _emit(progress_cb, 'Renderizando resto', pct, f'Generando clip {idx} de {len(plan["candidates"])}...')
+        _emit(progress_cb, 'Renderizando resto', pct, f'Sincronizando y generando clip {idx} de {len(plan["candidates"])}...')
         clip_entry = _render_single_candidate(
             source,
             folder,
@@ -491,9 +555,11 @@ def continue_batch(
             requested_cam,
             use_style,
             use_denoise,
+            align_model=align_model,
+            align_language=align_language,
+            cancel_event=cancel_event,
         )
         clips.append(clip_entry)
-        # Save incrementally so completed clips are immediately visible
         manifest['clips'] = sorted(clips, key=lambda c: c['id'])
         manifest['remaining_count'] = max(0, len(plan['candidates']) - len(clips))
         save_json(folder / 'manifest.json', manifest)

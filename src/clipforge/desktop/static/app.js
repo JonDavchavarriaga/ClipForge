@@ -2,24 +2,26 @@ const TOKEN = document.querySelector('meta[name="clipforge-token"]')?.content ||
 
 const state = {
   batches: [],
+  styleCatalog: [],
   selectedBatchId: '',
   selectedClipId: '',
+  clipFilter: 'active',
   currentBundle: null,
-  activeReviewJobId: null,
   currentEmbedUrl: '',
   completedJobIds: new Set(),
   latestReadyBatchId: '',
   procCustomCam: '',
   previewCustomCam: '',
+  edCustomCam: '',
 };
 
 const cropper = {
-  mode: 'process', // 'process' | 'preview'
+  mode: 'process', // 'process' | 'preview' | 'editor'
   offset: 0,
   dragging: false,
   startX: 0,
   startY: 0,
-  rect: null, // normalized {x, y, w, h}
+  rect: null,
 };
 
 function esc(value) {
@@ -33,10 +35,10 @@ function esc(value) {
 function showToast(msg, isError = false) {
   const el = document.getElementById('toast');
   el.textContent = msg;
-  el.style.borderColor = isError ? '#ef4444' : '#f97316';
+  el.style.borderColor = isError ? '#ef4444' : '#e2e8f0';
   el.classList.remove('hidden');
   clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => el.classList.add('hidden'), 4800);
+  showToast._t = setTimeout(() => el.classList.add('hidden'), 4600);
 }
 
 async function api(path, options = {}) {
@@ -49,7 +51,7 @@ async function api(path, options = {}) {
   try {
     resp = await fetch(path, { ...options, headers });
   } catch (networkErr) {
-    throw new Error('No se pudo conectar con el servidor local de ClipForge. Si lo apagaste, vuelve a abrir ClipForge desde tu escritorio.');
+    throw new Error('No se pudo conectar con Gevik Clip. Si lo cerraste, vuelve a abrirlo desde tu escritorio.');
   }
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
@@ -74,28 +76,33 @@ document.getElementById('queue-toggle-btn').addEventListener('click', (e) => {
   document.getElementById('queue-drawer').classList.toggle('hidden');
 });
 
-function openBatchInReview(batchId) {
+function openBatchInReview(batchId, clipId = '') {
   if (batchId) {
     state.selectedBatchId = batchId;
-    state.selectedClipId = 'clip-01';
+    state.selectedClipId = clipId || 'clip-01';
   }
   document.getElementById('queue-drawer').classList.add('hidden');
   switchTab('review');
 }
 
 document.getElementById('queue-jump-area').addEventListener('click', () => {
-  if (state.latestReadyBatchId) {
-    openBatchInReview(state.latestReadyBatchId);
-  } else if (state.batches.length) {
-    openBatchInReview(state.batches[0].id);
-  } else {
-    switchTab('review');
-  }
+  openBatchInReview(state.latestReadyBatchId || (state.batches[0]?.id || ''));
 });
 
 document.getElementById('queue-go-review-btn').addEventListener('click', (e) => {
   e.stopPropagation();
   openBatchInReview(state.latestReadyBatchId || (state.batches[0]?.id || ''));
+});
+
+document.getElementById('queue-cancel-btn').addEventListener('click', async (e) => {
+  e.stopPropagation();
+  try {
+    await api('/api/jobs/cancel', { method: 'POST', body: '{}' });
+    showToast('Cancelando tarea activa...');
+    refreshQueue();
+  } catch (err) {
+    showToast(err.message, true);
+  }
 });
 
 function formatDuration(secs) {
@@ -113,6 +120,32 @@ function releaseVideoPlayer() {
   player.pause();
   player.removeAttribute('src');
   player.load();
+}
+
+// --- VISUAL SUBTITLE STYLE CARDS ---
+function renderStyleGrid(containerId, hiddenInputId, activeId) {
+  const box = document.getElementById(containerId);
+  const hidden = document.getElementById(hiddenInputId);
+  if (!box || !state.styleCatalog.length) return;
+  hidden.value = activeId || 'highlight';
+  box.innerHTML = '';
+  state.styleCatalog.forEach((style) => {
+    const card = document.createElement('div');
+    card.className = `style-card ${style.id === hidden.value ? 'active' : ''}`;
+    const upperStyle = style.uppercase ? 'text-transform:uppercase;' : '';
+    const activeSpan = `<span style="color:${esc(style.accent_hex)};${style.word_highlight ? 'font-size:12.5px;' : ''}">${esc(style.sample_active)}</span>`;
+    card.innerHTML = `
+      <div class="style-preview" style="${upperStyle}">${esc(style.sample_before)} ${activeSpan} ${esc(style.sample_after)}</div>
+      <div class="style-name">${esc(style.label)}</div>
+    `;
+    card.title = style.description;
+    card.addEventListener('click', () => {
+      hidden.value = style.id;
+      box.querySelectorAll('.style-card').forEach((c) => c.classList.remove('active'));
+      card.classList.add('active');
+    });
+    box.appendChild(card);
+  });
 }
 
 function mountLiveEmbed(embedUrl, rawUrl) {
@@ -185,7 +218,7 @@ function renderLiveStatus(live) {
   });
 }
 
-// --- INTERACTIVE SNIPPING-TOOL WEBCAM CROPPER ---
+// --- SNIPPING-TOOL WEBCAM CROPPER ---
 function drawCropOverlay() {
   const img = document.getElementById('cropper-img');
   const canvas = document.getElementById('cropper-canvas');
@@ -198,24 +231,20 @@ function drawCropOverlay() {
   }
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, w, h);
-
   if (!cropper.rect) return;
   const rx = cropper.rect.x * w;
   const ry = cropper.rect.y * h;
   const rw = cropper.rect.w * w;
   const rh = cropper.rect.h * h;
 
-  // Dim outside the selection (Windows Snipping Tool style)
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.58)';
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.62)';
   ctx.fillRect(0, 0, w, h);
   ctx.clearRect(rx, ry, rw, rh);
 
-  // Crisp glowing orange frame
-  ctx.strokeStyle = '#f97316';
+  ctx.strokeStyle = '#e2e8f0';
   ctx.lineWidth = 3;
   ctx.strokeRect(rx, ry, rw, rh);
 
-  // Corner handles
   ctx.fillStyle = '#ffffff';
   const hs = 8;
   [[rx, ry], [rx + rw, ry], [rx, ry + rh], [rx + rw, ry + rh]].forEach(([cx, cy]) => {
@@ -228,22 +257,20 @@ function loadCropperFrame() {
   const applyBtn = document.getElementById('cropper-apply-btn');
   const label = document.getElementById('cropper-coords-label');
   let url = '';
-  if (cropper.mode === 'preview') {
-    url = `/api/frame?batch=${encodeURIComponent(state.selectedBatchId)}&t=${cropper.offset}&_=${Date.now()}`;
+  if (cropper.mode === 'preview' || cropper.mode === 'editor') {
+    url = `/api/frame?batch=${encodeURIComponent(state.selectedBatchId)}&clip=${encodeURIComponent(state.selectedClipId)}&t=${cropper.offset}&_=${Date.now()}`;
   } else {
     const src = document.getElementById('proc-source').value.trim();
     url = `/api/frame?source=${encodeURIComponent(src)}&t=${cropper.offset}&_=${Date.now()}`;
   }
-  label.textContent = 'Cargando fotograma del stream...';
+  label.textContent = 'Cargando fotograma...';
   applyBtn.disabled = !cropper.rect;
   img.onload = () => {
     drawCropOverlay();
-    label.textContent = cropper.rect
-      ? 'Recorte listo. Puedes volver a arrastrar o pulsar "Usar este recorte".'
-      : 'Arrastra con el mouse alrededor de tu cámara (como Recortes de Windows).';
+    label.textContent = 'Arrastra con el mouse alrededor de tu cámara.';
   };
   img.onerror = () => {
-    label.textContent = 'No se pudo cargar el fotograma. Verifica el video seleccionado.';
+    label.textContent = 'No se pudo cargar el fotograma.';
   };
   img.src = url;
 }
@@ -252,11 +279,11 @@ function openCropperModal(mode) {
   if (mode === 'process' && !document.getElementById('proc-source').value.trim()) {
     return showToast('Primero selecciona un video de la lista derecha.', true);
   }
-  if (mode === 'preview' && !state.selectedBatchId) {
-    return showToast('Primero selecciona un lote.', true);
+  if ((mode === 'preview' || mode === 'editor') && !state.selectedBatchId) {
+    return showToast('Primero selecciona un clip.', true);
   }
   cropper.mode = mode;
-  cropper.offset = mode === 'preview' ? 2 : 5;
+  cropper.offset = mode === 'process' ? 5 : 2;
   cropper.rect = null;
   document.getElementById('cropper-apply-btn').disabled = true;
   document.getElementById('cropper-modal').classList.remove('hidden');
@@ -282,11 +309,12 @@ cropCanvas.addEventListener('pointermove', (e) => {
   const box = cropCanvas.getBoundingClientRect();
   const curX = Math.max(0, Math.min(1, (e.clientX - box.left) / box.width));
   const curY = Math.max(0, Math.min(1, (e.clientY - box.top) / box.height));
-  const x = Math.min(cropper.startX, curX);
-  const y = Math.min(cropper.startY, curY);
-  const w = Math.abs(curX - cropper.startX);
-  const h = Math.abs(curY - cropper.startY);
-  cropper.rect = { x, y, w, h };
+  cropper.rect = {
+    x: Math.min(cropper.startX, curX),
+    y: Math.min(cropper.startY, curY),
+    w: Math.abs(curX - cropper.startX),
+    h: Math.abs(curY - cropper.startY),
+  };
   drawCropOverlay();
 });
 
@@ -297,53 +325,50 @@ cropCanvas.addEventListener('pointerup', () => {
     cropper.rect = null;
     drawCropOverlay();
     document.getElementById('cropper-apply-btn').disabled = true;
-    document.getElementById('cropper-coords-label').textContent = 'Haz un recuadro un poco más grande alrededor de tu cámara.';
+    document.getElementById('cropper-coords-label').textContent = 'Haz un recuadro un poco más grande.';
     return;
   }
   document.getElementById('cropper-apply-btn').disabled = false;
   document.getElementById('cropper-coords-label').textContent =
-    `✓ Recorte seleccionado (${Math.round(cropper.rect.w * 100)}% × ${Math.round(cropper.rect.h * 100)}%)`;
+    `✓ Recorte listo (${Math.round(cropper.rect.w * 100)}% × ${Math.round(cropper.rect.h * 100)}%)`;
 });
 
-document.getElementById('cropper-next-frame-btn').addEventListener('click', () => {
-  cropper.offset += 15;
-  loadCropperFrame();
-});
+document.getElementById('cropper-next-frame-btn').addEventListener('click', () => { cropper.offset += 15; loadCropperFrame(); });
 document.getElementById('cropper-close-btn').addEventListener('click', closeCropperModal);
 document.getElementById('cropper-cancel-btn').addEventListener('click', closeCropperModal);
 document.getElementById('proc-open-cropper-btn').addEventListener('click', () => openCropperModal('process'));
 document.getElementById('preview-open-cropper-btn').addEventListener('click', () => openCropperModal('preview'));
+document.getElementById('ed-crop-cam-btn').addEventListener('click', () => openCropperModal('editor'));
 
 document.getElementById('cropper-apply-btn').addEventListener('click', async () => {
   if (!cropper.rect) return;
-  const spec = [cropper.rect.x, cropper.rect.y, cropper.rect.w, cropper.rect.h]
-    .map((v) => v.toFixed(4))
-    .join(',');
+  const spec = [cropper.rect.x, cropper.rect.y, cropper.rect.w, cropper.rect.h].map((v) => v.toFixed(4)).join(',');
   closeCropperModal();
 
   if (cropper.mode === 'process') {
     state.procCustomCam = spec;
     document.getElementById('proc-layout').value = 'split-cam';
-    document.getElementById('proc-cam-status').textContent = '✓ Cámara recortada manualmente (lista para split-cam)';
-    showToast('Recorte de cámara guardado para generar clips');
+    document.getElementById('proc-cam-status').textContent = '✓ Cámara recortada manualmente';
+    showToast('Recorte de cámara guardado');
+    return;
+  }
+  if (cropper.mode === 'editor') {
+    state.edCustomCam = spec;
+    document.getElementById('ed-layout').value = 'split-cam';
+    showToast('Cámara lista — pulsa "💾 Aplicar edición" para renderizar');
     return;
   }
 
-  // Preview mode: immediately re-render clip-01 with the exact snipped webcam box!
   state.previewCustomCam = spec;
   document.getElementById('preview-layout').value = 'split-cam';
   releaseVideoPlayer();
   try {
     await api('/api/batch/retest-preview', {
       method: 'POST',
-      body: JSON.stringify({
-        batch: state.selectedBatchId,
-        layout: 'split-cam',
-        cam_region: spec,
-      }),
+      body: JSON.stringify({ batch: state.selectedBatchId, layout: 'split-cam', cam_region: spec }),
     });
     refreshQueue();
-    showToast('Aplicando tu recorte de cámara en clip-01...');
+    showToast('Aplicando recorte en clip-01...');
   } catch (err) {
     showToast(err.message, true);
   }
@@ -364,7 +389,7 @@ document.querySelectorAll('.preset-btn').forEach((btn) => {
     if (cfg) {
       document.getElementById('proc-layout').value = cfg.layout;
       document.getElementById('proc-cam-region').value = cfg.cam;
-      document.getElementById('proc-caption-style').value = cfg.style;
+      renderStyleGrid('proc-style-grid', 'proc-caption-style', cfg.style);
     }
   });
 });
@@ -372,11 +397,16 @@ document.querySelectorAll('.preset-btn').forEach((btn) => {
 async function refreshStatus() {
   try {
     const data = await api('/api/status');
+    state.styleCatalog = data.style_catalog || [];
+    renderStyleGrid('proc-style-grid', 'proc-caption-style', document.getElementById('proc-caption-style').value || 'highlight');
+    renderStyleGrid('ed-style-grid', 'ed-caption-style', document.getElementById('ed-caption-style').value || 'highlight');
+
+    const tr = data.translators || {};
     const badges = document.getElementById('agent-badges');
     badges.innerHTML = `
-      <span class="badge ok">Gemini Antigravity</span>
-      <span class="badge ${data.agents.claude ? 'ok' : 'off'}">Claude ${data.agents.claude ? 'OK' : 'N/D'}</span>
-      <span class="badge ${data.agents.codex ? 'ok' : 'off'}">Codex ${data.agents.codex ? 'OK' : 'N/D'}</span>
+      <span class="badge ${tr.claude?.available ? 'ok' : 'off'}">Claude ${tr.claude?.available ? 'OK' : 'N/D'}</span>
+      <span class="badge ${tr.codex?.available ? 'ok' : 'off'}">Codex ${tr.codex?.available ? 'OK' : 'N/D'}</span>
+      <span class="badge ${tr.gemini?.available ? 'ok' : 'off'}">Gemini ${tr.gemini?.available ? 'OK' : 'Config'}</span>
     `;
     if (data.workspace?.root) {
       document.getElementById('workspace-root-path').textContent = `Carpeta local: ${data.workspace.root}`;
@@ -407,7 +437,7 @@ async function refreshSources() {
       row.addEventListener('click', () => {
         document.getElementById('proc-source').value = src.path;
         state.procCustomCam = '';
-        document.getElementById('proc-cam-status').textContent = 'Cámara: detección automática (o recórtala en el fotograma)';
+        document.getElementById('proc-cam-status').textContent = 'Cámara: automática (recorta en fotograma para precisión)';
         document.getElementById('proc-preview-first').checked = isFull || src.size_mb > 45;
         showToast(`Seleccionado: ${src.relative}`);
       });
@@ -442,7 +472,6 @@ async function refreshLibrary() {
         row.addEventListener('click', () => {
           document.getElementById('proc-source').value = item.path;
           state.procCustomCam = '';
-          document.getElementById('proc-cam-status').textContent = 'Cámara: detección automática (o recórtala en el fotograma)';
           document.getElementById('proc-preview-first').checked = item.name === 'full_recording.mp4' || item.size_mb > 45;
           switchTab('process');
           showToast(`Cargado ${item.name}`);
@@ -457,6 +486,29 @@ async function refreshLibrary() {
   }
 }
 
+// --- CLIP MANAGER & FILTERS ---
+document.querySelectorAll('.filter-pill').forEach((pill) => {
+  pill.addEventListener('click', () => {
+    document.querySelectorAll('.filter-pill').forEach((p) => p.classList.remove('active'));
+    pill.classList.add('active');
+    state.clipFilter = pill.dataset.filter;
+    renderClipList();
+  });
+});
+
+function statusLabel(st) {
+  if (st === 'approved') return { text: 'Aprobado', cls: 'ok' };
+  if (st === 'discarded') return { text: 'Descartado', cls: 'danger' };
+  if (st === 'published') return { text: 'Publicado', cls: 'auto' };
+  return { text: 'Por revisar', cls: 'warn' };
+}
+
+function getSelectedClipObj() {
+  const batch = state.batches.find((b) => b.id === state.selectedBatchId);
+  if (!batch) return null;
+  return batch.clips.find((c) => c.id === state.selectedClipId) || null;
+}
+
 async function refreshBatches() {
   try {
     const data = await api('/api/batches');
@@ -464,7 +516,7 @@ async function refreshBatches() {
     const select = document.getElementById('batch-select');
     select.innerHTML = '';
     if (!state.batches.length) {
-      select.innerHTML = '<option value="">Sin lotes aún</option>';
+      select.innerHTML = '<option value="">Sin proyectos aún</option>';
       document.getElementById('clip-selector').innerHTML = '<div class="muted">Genera tu primer clip en "Generar Clips 9:16".</div>';
       document.getElementById('preview-approval-card').classList.add('hidden');
       return;
@@ -472,10 +524,11 @@ async function refreshBatches() {
     state.batches.forEach((b) => {
       const opt = document.createElement('option');
       opt.value = b.id;
+      const pending = b.clips.filter((c) => c.review_status === 'pending').length;
       const suffix = b.status === 'awaiting_preview_approval'
-        ? ` — ⏳ Prueba cámara (${b.clips.length}/${b.planned_total})`
-        : ` (${b.clips.length} clips)`;
-      opt.textContent = `${b.id}${suffix}`;
+        ? ` · ⏳ Prueba cámara (${b.clips.length}/${b.planned_total})`
+        : ` (${b.clips.length} clips · ${pending} por revisar)`;
+      opt.textContent = `${b.display_name || b.id}${suffix}`;
       select.appendChild(opt);
     });
     if (!state.selectedBatchId || !state.batches.some((b) => b.id === state.selectedBatchId)) {
@@ -496,9 +549,9 @@ function renderPreviewApprovalBanner(batch) {
   }
   card.classList.remove('hidden');
   const mutedCount = (batch.muted_ranges || []).length;
-  const mutedInfo = mutedCount ? ` · Se saltaron ${mutedCount} bloque(s) mudo(s)/comerciales.` : '';
+  const mutedInfo = mutedCount ? ` · Se saltaron ${mutedCount} bloque(s) comerciales mudos.` : '';
   document.getElementById('preview-approval-summary').textContent =
-    `Clip 1 de ${batch.planned_total} listo. Si la cámara no enfoca tu cara, pulsa "✂️ Recortar cámara en el fotograma" y dibuja el cuadro con el mouse.${mutedInfo}`;
+    `Clip 1 de ${batch.planned_total} listo. Si la cámara no enfoca tu cara, pulsa "✂️ Recortar cámara en fotograma".${mutedInfo}`;
   document.getElementById('preview-continue-btn').textContent =
     `✅ Cámara OK — Generar los ${batch.remaining_count} clips restantes`;
   const firstClip = batch.clips[0];
@@ -511,81 +564,279 @@ function renderClipList() {
   const box = document.getElementById('clip-selector');
   box.innerHTML = '';
   if (!batch || !batch.clips.length) {
-    box.innerHTML = '<div class="muted">Este lote no tiene clips.</div>';
+    box.innerHTML = '<div class="muted">Este proyecto no tiene clips.</div>';
     return;
   }
-  if (!state.selectedClipId || !batch.clips.some((c) => c.id === state.selectedClipId)) {
-    state.selectedClipId = batch.clips[0].id;
+  const filtered = batch.clips.filter((c) => {
+    if (state.clipFilter === 'active') return c.review_status !== 'discarded';
+    return c.review_status === state.clipFilter;
+  });
+  if (!filtered.length) {
+    box.innerHTML = '<div class="muted">No hay clips en este filtro.</div>';
+    return;
   }
-  batch.clips.forEach((clip) => {
-    const row = document.createElement('div');
-    row.className = `list-item ${clip.id === state.selectedClipId ? 'selected' : ''}`;
-    const approved = clip.approval ? '<span class="badge ok">aprobado</span>' : '<span class="badge off">pendiente</span>';
-    row.innerHTML = `<span><strong>${esc(clip.id)}</strong> · ${esc(clip.layout || '')} (${Math.round(clip.end - clip.start)}s)</span>${approved}`;
-    row.addEventListener('click', () => {
+  if (!state.selectedClipId || !filtered.some((c) => c.id === state.selectedClipId)) {
+    state.selectedClipId = filtered[0].id;
+  }
+  filtered.forEach((clip) => {
+    const st = statusLabel(clip.review_status);
+    const card = document.createElement('div');
+    card.className = `clip-card ${clip.id === state.selectedClipId ? 'selected' : ''}`;
+    const thumbUrl = `/api/thumb?batch=${encodeURIComponent(batch.id)}&clip=${encodeURIComponent(clip.id)}&_=${Math.round(clip.end * 10)}`;
+    card.innerHTML = `
+      <img class="clip-thumb" src="${thumbUrl}" alt="${esc(clip.id)}" />
+      <div>
+        <div class="clip-card-title">${esc(clip.display_title || clip.id)}</div>
+        <div class="clip-card-meta">
+          <span>${Math.round(clip.end - clip.start)}s</span>
+          <span class="badge ${st.cls}">${st.text}</span>
+        </div>
+      </div>
+    `;
+    card.addEventListener('click', () => {
       state.selectedClipId = clip.id;
       renderClipList();
       loadSelectedClip();
     });
-    box.appendChild(row);
+    box.appendChild(card);
   });
   loadSelectedClip();
 }
 
 async function loadSelectedClip() {
-  if (!state.selectedBatchId || !state.selectedClipId) return;
-  const player = document.getElementById('clip-player');
-  player.src = `/api/media?batch=${encodeURIComponent(state.selectedBatchId)}&clip=${encodeURIComponent(state.selectedClipId)}&t=${Date.now()}`;
-  document.getElementById('pub-selected-info').textContent = `Seleccionado: ${state.selectedBatchId} / ${state.selectedClipId}`;
+  const clip = getSelectedClipObj();
+  if (!state.selectedBatchId || !clip) return;
 
-  const dst = document.getElementById('tr-dst').value;
+  const player = document.getElementById('clip-player');
+  player.src = `/api/media?batch=${encodeURIComponent(state.selectedBatchId)}&clip=${encodeURIComponent(clip.id)}&t=${Date.now()}`;
+
+  document.getElementById('clip-title-input').value = clip.display_title || clip.id;
+  const st = statusLabel(clip.review_status);
+  const badge = document.getElementById('clip-status-badge');
+  badge.textContent = st.text;
+  badge.className = `badge ${st.cls}`;
+
+  const discardBtn = document.getElementById('clip-discard-btn');
+  discardBtn.textContent = clip.review_status === 'discarded' ? '♻️ Restaurar' : '🗑️ Descartar';
+
+  // Populate Mini-Editor fields
+  state.edCustomCam = '';
+  document.getElementById('ed-start').value = Number(clip.start).toFixed(1);
+  document.getElementById('ed-end').value = Number(clip.end).toFixed(1);
+  document.getElementById('ed-layout').value = clip.layout || 'split-cam';
+  document.getElementById('ed-pos').value = clip.subtitle_position || 'bottom';
+  document.getElementById('ed-offset').value = String(clip.subtitle_offset_ms || 0);
+  document.getElementById('ed-offset-val').textContent = `${clip.subtitle_offset_ms || 0} ms`;
+  document.getElementById('ed-vol').value = String(clip.volume_db || 0);
+  document.getElementById('ed-vol-val').textContent = `${clip.volume_db || 0} dB`;
+  document.getElementById('ed-denoise').checked = clip.denoise !== false;
+  renderStyleGrid('ed-style-grid', 'ed-caption-style', clip.caption_style || 'highlight');
+
+  document.getElementById('pub-selected-info').textContent = `Clip activo: ${clip.display_title || clip.id}`;
+  if (!document.getElementById('pub-title').value) {
+    document.getElementById('pub-title').value = clip.display_title || '';
+  }
+}
+
+// Live slider labels in Mini-Editor
+document.getElementById('ed-offset').addEventListener('input', (e) => {
+  document.getElementById('ed-offset-val').textContent = `${e.target.value} ms`;
+});
+document.getElementById('ed-vol').addEventListener('input', (e) => {
+  document.getElementById('ed-vol-val').textContent = `${e.target.value} dB`;
+});
+
+// Mark IN / OUT from video player current time
+document.getElementById('ed-mark-in-btn').addEventListener('click', () => {
+  const clip = getSelectedClipObj();
+  if (!clip) return;
+  const t = document.getElementById('clip-player').currentTime || 0;
+  document.getElementById('ed-start').value = (Number(clip.start) + t).toFixed(1);
+  showToast(`Nuevo inicio marcado (+${t.toFixed(1)}s)`);
+});
+document.getElementById('ed-mark-out-btn').addEventListener('click', () => {
+  const clip = getSelectedClipObj();
+  if (!clip) return;
+  const t = document.getElementById('clip-player').currentTime || 0;
+  if (t < 1.0) return showToast('Avanza al menos 1 segundo para marcar el final.', true);
+  document.getElementById('ed-end').value = (Number(clip.start) + t).toFixed(1);
+  showToast(`Nuevo final marcado (+${t.toFixed(1)}s)`);
+});
+
+// Clip quick actions (Download, Reveal, Rename, Approve, Discard)
+document.getElementById('clip-download-btn').addEventListener('click', () => {
+  if (!state.selectedBatchId || !state.selectedClipId) return showToast('Selecciona un clip.', true);
+  window.location.href = `/api/download?batch=${encodeURIComponent(state.selectedBatchId)}&clip=${encodeURIComponent(state.selectedClipId)}`;
+});
+
+document.getElementById('clip-reveal-btn').addEventListener('click', async () => {
+  if (!state.selectedBatchId || !state.selectedClipId) return;
   try {
-    const res = await api(`/api/translation?batch=${encodeURIComponent(state.selectedBatchId)}&clip=${encodeURIComponent(state.selectedClipId)}&target_lang=${encodeURIComponent(dst)}`);
-    if (res.exists && res.bundle) {
-      state.currentBundle = res.bundle;
-      renderCuesEditor();
-    } else {
-      state.currentBundle = null;
-      document.getElementById('cues-editor').innerHTML = res.has_srt
-        ? '<div class="muted">Pulsa "Empaquetar SRT" para traducir o ajustar subtítulos.</div>'
-        : '<div class="muted">Este clip no tiene archivo captions.srt.</div>';
-    }
+    await api('/api/clip/reveal', { method: 'POST', body: JSON.stringify({ batch: state.selectedBatchId, clip: state.selectedClipId }) });
+  } catch (err) {
+    showToast(err.message, true);
+  }
+});
+
+async function updateClipStatus(newStatus, customTitle = undefined) {
+  if (!state.selectedBatchId || !state.selectedClipId) return;
+  try {
+    await api('/api/clip/status', {
+      method: 'POST',
+      body: JSON.stringify({
+        batch: state.selectedBatchId,
+        clip: state.selectedClipId,
+        status: newStatus || undefined,
+        display_title: customTitle,
+      }),
+    });
+    await refreshBatches();
+    if (newStatus) showToast(`Estado actualizado: ${statusLabel(newStatus).text}`);
   } catch (err) {
     showToast(err.message, true);
   }
 }
 
+document.getElementById('clip-title-input').addEventListener('change', (e) => {
+  updateClipStatus('', e.target.value);
+});
+document.getElementById('clip-approve-quick-btn').addEventListener('click', () => updateClipStatus('approved'));
+document.getElementById('clip-discard-btn').addEventListener('click', () => {
+  const clip = getSelectedClipObj();
+  if (!clip) return;
+  updateClipStatus(clip.review_status === 'discarded' ? 'pending' : 'discarded');
+});
+
+document.getElementById('purge-discarded-btn').addEventListener('click', async () => {
+  try {
+    const res = await api('/api/clip/purge-discarded', { method: 'POST', body: '{}' });
+    refreshBatches();
+    showToast(res.purged ? `Se liberó espacio borrando ${res.purged} clip(s) descartado(s).` : 'No había clips descartados.');
+  } catch (err) {
+    showToast(err.message, true);
+  }
+});
+
+// 1-Click Automatic Natural Translation (Claude / Codex / Gemini)
+document.getElementById('tr-auto-btn').addEventListener('click', async () => {
+  if (!state.selectedBatchId || !state.selectedClipId) return showToast('Selecciona un clip primero.', true);
+  releaseVideoPlayer();
+  try {
+    const engine = document.getElementById('tr-engine').value;
+    const res = await api('/api/clip/auto-translate', {
+      method: 'POST',
+      body: JSON.stringify({
+        batch: state.selectedBatchId,
+        clip: state.selectedClipId,
+        source_lang: document.getElementById('tr-src').value,
+        target_lang: document.getElementById('tr-dst').value,
+        engine,
+        caption_style: document.getElementById('ed-caption-style').value || 'highlight',
+        context: document.getElementById('tr-context').value,
+      }),
+    });
+    refreshQueue();
+    showToast(`Traduciendo clip completo con ${engine} en la cola...`);
+  } catch (err) {
+    showToast(err.message, true);
+  }
+});
+
+// Optional manual text editor inside <details>
 function renderCuesEditor() {
   const container = document.getElementById('cues-editor');
-  if (!state.currentBundle || !state.currentBundle.cues) {
-    container.innerHTML = '<div class="muted">Sin bloques cargados.</div>';
-    return;
-  }
+  if (!state.currentBundle?.cues) return;
   container.innerHTML = '';
   state.currentBundle.cues.forEach((cue) => {
     const row = document.createElement('div');
     row.className = 'cue-row';
-    const countSpanId = `count-${Number(cue.id)}`;
     const len = (cue.translated_text || '').length;
     row.innerHTML = `
-      <div class="cue-meta">
-        <span>#${Number(cue.id)} · ${Number(cue.start).toFixed(2)}s → ${Number(cue.end).toFixed(2)}s</span>
-        <span id="${countSpanId}" class="${len > 36 ? 'char-warn' : ''}">${len}/36 chars</span>
-      </div>
-      <div class="cue-src">Original: ${esc(cue.source_text)}</div>
-      <input type="text" data-cue-id="${Number(cue.id)}" value="${esc(cue.translated_text || '')}" placeholder="Escribe la traducción natural aquí..." />
+      <div class="cue-meta"><span>#${Number(cue.id)} · ${Number(cue.start).toFixed(2)}s</span><span class="${len > 36 ? 'char-warn' : ''}">${len}/36</span></div>
+      <div class="cue-src">${esc(cue.source_text)}</div>
+      <input type="text" value="${esc(cue.translated_text || '')}" />
     `;
-    const input = row.querySelector('input');
-    input.addEventListener('input', (e) => {
-      cue.translated_text = e.target.value;
-      const counter = document.getElementById(countSpanId);
-      counter.textContent = `${cue.translated_text.length}/36 chars`;
-      counter.className = cue.translated_text.length > 36 ? 'char-warn' : '';
-    });
+    row.querySelector('input').addEventListener('input', (e) => { cue.translated_text = e.target.value; });
     container.appendChild(row);
   });
 }
 
+document.getElementById('tr-pack-btn').addEventListener('click', async () => {
+  if (!state.selectedBatchId || !state.selectedClipId) return showToast('Selecciona un clip.', true);
+  try {
+    const dst = document.getElementById('tr-dst').value;
+    const existing = await api(`/api/translation?batch=${encodeURIComponent(state.selectedBatchId)}&clip=${encodeURIComponent(state.selectedClipId)}&target_lang=${encodeURIComponent(dst)}`);
+    if (existing.exists && existing.bundle) {
+      state.currentBundle = existing.bundle;
+    } else {
+      const res = await api('/api/translation/pack', {
+        method: 'POST',
+        body: JSON.stringify({
+          batch: state.selectedBatchId,
+          clip: state.selectedClipId,
+          source_lang: document.getElementById('tr-src').value,
+          target_lang: dst,
+          context: document.getElementById('tr-context').value,
+        }),
+      });
+      state.currentBundle = res.bundle;
+    }
+    renderCuesEditor();
+  } catch (err) {
+    showToast(err.message, true);
+  }
+});
+
+document.getElementById('tr-apply-manual-btn').addEventListener('click', async () => {
+  if (!state.currentBundle) return showToast('Carga primero los bloques.', true);
+  releaseVideoPlayer();
+  try {
+    await api('/api/translation/apply', {
+      method: 'POST',
+      body: JSON.stringify({
+        batch: state.selectedBatchId,
+        clip: state.selectedClipId,
+        bundle: state.currentBundle,
+        ass_style: document.getElementById('ed-caption-style').value || 'highlight',
+        rerender: true,
+      }),
+    });
+    refreshQueue();
+    showToast('Re-renderizando clip con texto ajustado...');
+  } catch (err) {
+    showToast(err.message, true);
+  }
+});
+
+// Mini-Editor Apply
+document.getElementById('ed-apply-btn').addEventListener('click', async () => {
+  if (!state.selectedBatchId || !state.selectedClipId) return showToast('Selecciona un clip.', true);
+  releaseVideoPlayer();
+  try {
+    await api('/api/clip/edit', {
+      method: 'POST',
+      body: JSON.stringify({
+        batch: state.selectedBatchId,
+        clip: state.selectedClipId,
+        start: Number(document.getElementById('ed-start').value),
+        end: Number(document.getElementById('ed-end').value),
+        layout: document.getElementById('ed-layout').value,
+        cam_region: state.edCustomCam || undefined,
+        caption_style: document.getElementById('ed-caption-style').value,
+        subtitle_position: document.getElementById('ed-pos').value,
+        subtitle_offset_ms: Number(document.getElementById('ed-offset').value),
+        volume_db: Number(document.getElementById('ed-vol').value),
+        denoise: document.getElementById('ed-denoise').checked,
+      }),
+    });
+    refreshQueue();
+    showToast('Aplicando edición en la cola...');
+  } catch (err) {
+    showToast(err.message, true);
+  }
+});
+
+// Queue polling
 async function refreshQueue() {
   try {
     const snap = await api('/api/jobs');
@@ -597,19 +848,19 @@ async function refreshQueue() {
     const fill = document.getElementById('queue-progress-fill');
     const countEl = document.getElementById('queue-count');
     const goReviewBtn = document.getElementById('queue-go-review-btn');
+    const cancelBtn = document.getElementById('queue-cancel-btn');
     const itemsBox = document.getElementById('queue-items');
 
     const active = snap.active;
     const pendingTotal = (active ? 1 : 0) + (snap.queued_count || 0);
     countEl.textContent = String(pendingTotal);
+    cancelBtn.classList.toggle('hidden', !active);
 
     const readyJob = snap.jobs.find((j) => j.status === 'done' && j.result?.batch_id);
     if (readyJob) {
       state.latestReadyBatchId = readyJob.result.batch_id;
       goReviewBtn.classList.remove('hidden');
-      goReviewBtn.textContent = readyJob.result.status === 'awaiting_preview_approval'
-        ? '🎯 Revisar cámara →'
-        : '🎬 Ir a Revisar →';
+      goReviewBtn.textContent = readyJob.result.status === 'awaiting_preview_approval' ? '🎯 Revisar cámara →' : '🎬 Ir a Clips →';
     } else if (state.batches.length) {
       state.latestReadyBatchId = state.batches[0].id;
       goReviewBtn.classList.remove('hidden');
@@ -627,18 +878,18 @@ async function refreshQueue() {
     } else if (snap.jobs.length) {
       bar.classList.remove('running');
       const last = snap.jobs[0];
-      dot.className = `q-dot ${last.status === 'failed' ? 'failed' : 'done'}`;
+      dot.className = `q-dot ${last.status === 'failed' ? 'failed' : (last.status === 'cancelled' ? 'idle' : 'done')}`;
       headline.textContent = last.status === 'failed'
         ? `⚠️ Error en: ${last.label}`
-        : `✅ Listo: ${last.label} (clic aquí para revisar)`;
+        : (last.status === 'cancelled' ? `⏹️ Cancelado: ${last.label}` : `✅ Listo: ${last.label}`);
       detail.textContent = last.detail || last.stage;
-      pctEl.textContent = last.status === 'failed' ? '!' : '100%';
-      fill.style.width = '100%';
+      pctEl.textContent = last.status === 'failed' ? '!' : (last.status === 'cancelled' ? '—' : '100%');
+      fill.style.width = last.status === 'done' ? '100%' : '0%';
     } else {
       bar.classList.remove('running');
       dot.className = 'q-dot idle';
       headline.textContent = 'Cola lista · Sin procesos en curso';
-      detail.textContent = 'Las tareas se ejecutan en orden. Haz clic aquí cuando haya clips listos para ir a Revisar.';
+      detail.textContent = 'Gevik Clip trabaja en baja prioridad para no afectar tus juegos ni streams.';
       pctEl.textContent = '0%';
       fill.style.width = '0%';
     }
@@ -654,7 +905,7 @@ async function refreshQueue() {
           ? `⚙️ ${job.percent}% · ${esc(job.stage)}`
           : (job.status === 'queued'
             ? `⏳ #${job.queue_position} En cola`
-            : (job.status === 'done' ? `✅ Listo (${formatDuration(job.elapsed_seconds)})` : '❌ Error'));
+            : (job.status === 'done' ? `✅ Listo (${formatDuration(job.elapsed_seconds)})` : (job.status === 'cancelled' ? '⏹️ Cancelado' : '❌ Error')));
         row.innerHTML = `
           <div>
             <strong>${esc(job.label)}</strong>
@@ -666,13 +917,13 @@ async function refreshQueue() {
         `;
         if (job.status === 'done' && job.result?.batch_id) {
           row.style.cursor = 'pointer';
-          row.addEventListener('click', () => openBatchInReview(job.result.batch_id));
+          row.addEventListener('click', () => openBatchInReview(job.result.batch_id, job.result.clip_id || 'clip-01'));
           const openBtn = document.createElement('button');
-          openBtn.className = 'btn btn-primary btn-compact';
-          openBtn.textContent = job.result.status === 'awaiting_preview_approval' ? 'Revisar cámara →' : 'Revisar →';
+          openBtn.className = 'btn btn-silver btn-compact';
+          openBtn.textContent = 'Abrir →';
           openBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            openBatchInReview(job.result.batch_id);
+            openBatchInReview(job.result.batch_id, job.result.clip_id || 'clip-01');
           });
           row.lastElementChild.appendChild(openBtn);
         }
@@ -680,21 +931,15 @@ async function refreshQueue() {
 
         if (job.status === 'done' && !state.completedJobIds.has(job.id)) {
           state.completedJobIds.add(job.id);
-          if (job.id === state.activeReviewJobId && job.result?.reports?.length) {
-            state.activeReviewJobId = null;
-            document.getElementById('agent-report-text').textContent =
-              job.result.reports.map((r) => r.content).join('\n\n---\n\n');
-            document.getElementById('agent-report-box').classList.remove('hidden');
-            showToast('Revisión de agente completada');
-          } else if (job.result?.batch_id) {
+          if (job.result?.batch_id) {
             refreshBatches();
-            if (job.kind === 'retest-preview') {
+            if (['retest-preview', 'edit', 'auto-translate', 'rerender'].includes(job.kind)) {
               loadSelectedClip();
-              showToast('Encuadre de cámara actualizado en clip-01');
+              showToast(`Listo: ${job.label}`);
             } else if (job.result.status === 'awaiting_preview_approval') {
-              showToast(`Clip 1 listo para aprobar cámara (${job.result.batch_id})`);
+              showToast(`Clip 1 listo para aprobar cámara`);
             } else {
-              showToast(`Lote terminado: ${job.result.batch_id}`);
+              showToast(`Proyecto listo: ${job.result.display_name || job.result.batch_id}`);
             }
           }
         }
@@ -708,16 +953,9 @@ async function refreshQueue() {
 // Live controls
 document.getElementById('live-watch-btn').addEventListener('click', async () => {
   try {
-    const res = await api('/api/live/embed', {
-      method: 'POST',
-      body: JSON.stringify({ url: document.getElementById('live-url').value }),
-    });
-    if (res.embed.embed_url) {
-      mountLiveEmbed(res.embed.embed_url, res.embed.url);
-      showToast(`Viendo ${res.embed.platform}/${res.embed.channel}`);
-    } else {
-      showToast('Esta URL no soporta reproductor embebido, pero sí puedes grabarla.', true);
-    }
+    const res = await api('/api/live/embed', { method: 'POST', body: JSON.stringify({ url: document.getElementById('live-url').value }) });
+    if (res.embed.embed_url) mountLiveEmbed(res.embed.embed_url, res.embed.url);
+    else showToast('Esta URL no soporta reproductor embebido, pero sí puedes grabarla.', true);
   } catch (err) {
     showToast(err.message, true);
   }
@@ -729,7 +967,6 @@ document.getElementById('live-start-btn').addEventListener('click', async () => 
     api('/api/live/embed', { method: 'POST', body: JSON.stringify({ url }) })
       .then((r) => { if (r.embed?.embed_url) mountLiveEmbed(r.embed.embed_url, r.embed.url); })
       .catch(() => {});
-
     const res = await api('/api/live/start', {
       method: 'POST',
       body: JSON.stringify({
@@ -820,25 +1057,24 @@ document.getElementById('proc-start-btn').addEventListener('click', async () => 
       }),
     });
     refreshQueue();
-    showToast(`Añadido a la cola: ${res.job.label}`);
+    showToast(`En cola: ${res.job.label}`);
   } catch (err) {
     showToast(err.message, true);
   }
 });
 
-// Camera Calibration: Retest clip-01 & Continue batch
+// Camera Calibration
 document.getElementById('preview-retest-btn').addEventListener('click', async () => {
   if (!state.selectedBatchId) return;
   releaseVideoPlayer();
   try {
-    const preset = document.getElementById('preview-cam-preset').value;
     state.previewCustomCam = '';
     await api('/api/batch/retest-preview', {
       method: 'POST',
       body: JSON.stringify({
         batch: state.selectedBatchId,
         layout: document.getElementById('preview-layout').value,
-        cam_region: preset,
+        cam_region: document.getElementById('preview-cam-preset').value,
       }),
     });
     refreshQueue();
@@ -860,13 +1096,12 @@ document.getElementById('preview-continue-btn').addEventListener('click', async 
       }),
     });
     refreshQueue();
-    showToast('Generando los clips restantes en la cola...');
+    showToast('Generando clips restantes en la cola...');
   } catch (err) {
     showToast(err.message, true);
   }
 });
 
-// Translation & Agent review
 document.getElementById('batch-select').addEventListener('change', (e) => {
   state.selectedBatchId = e.target.value;
   state.selectedClipId = '';
@@ -874,109 +1109,9 @@ document.getElementById('batch-select').addEventListener('change', (e) => {
   renderClipList();
 });
 
-function requireSelectedClip() {
-  if (!state.selectedBatchId || !state.selectedClipId) {
-    showToast('Primero genera y selecciona un clip en "Revisar y Traducir".', true);
-    return false;
-  }
-  return true;
-}
-
-document.getElementById('tr-pack-btn').addEventListener('click', async () => {
-  if (!requireSelectedClip()) return;
-  try {
-    const dst = document.getElementById('tr-dst').value;
-    const res = await api('/api/translation/pack', {
-      method: 'POST',
-      body: JSON.stringify({
-        batch: state.selectedBatchId,
-        clip: state.selectedClipId,
-        source_lang: document.getElementById('tr-src').value,
-        target_lang: dst,
-        channel: dst === 'es' ? 'es_main' : 'en_main',
-        context: document.getElementById('tr-context').value,
-      }),
-    });
-    state.currentBundle = res.bundle;
-    renderCuesEditor();
-    showToast(`Paquete listo (${res.bundle.cues.length} bloques)`);
-  } catch (err) {
-    showToast(err.message, true);
-  }
-});
-
-document.getElementById('tr-save-btn').addEventListener('click', async () => {
-  if (!requireSelectedClip() || !state.currentBundle) return showToast('Empaqueta primero un SRT.', true);
-  try {
-    await api('/api/translation/save', {
-      method: 'POST',
-      body: JSON.stringify({
-        batch: state.selectedBatchId,
-        clip: state.selectedClipId,
-        bundle: state.currentBundle,
-      }),
-    });
-    showToast('Borrador guardado');
-  } catch (err) {
-    showToast(err.message, true);
-  }
-});
-
-async function triggerAgentReview(agent) {
-  if (!requireSelectedClip()) return;
-  if (state.currentBundle) {
-    await api('/api/translation/save', {
-      method: 'POST',
-      body: JSON.stringify({
-        batch: state.selectedBatchId,
-        clip: state.selectedClipId,
-        bundle: state.currentBundle,
-      }),
-    });
-  }
-  const res = await api('/api/agent-review', {
-    method: 'POST',
-    body: JSON.stringify({
-      agent,
-      batch: state.selectedBatchId,
-      clip: state.selectedClipId,
-      target_lang: document.getElementById('tr-dst').value,
-      task: 'Revisa naturalidad EN↔ES, tono gamer/stream, glosario y límite de 36 caracteres por línea.',
-    }),
-  });
-  state.activeReviewJobId = res.job.id;
-  refreshQueue();
-  showToast(`Enviado a ${agent} en la cola...`);
-}
-
-document.getElementById('tr-claude-btn').addEventListener('click', () => triggerAgentReview('claude').catch((e) => showToast(e.message, true)));
-document.getElementById('tr-codex-btn').addEventListener('click', () => triggerAgentReview('codex').catch((e) => showToast(e.message, true)));
-
-document.getElementById('tr-apply-btn').addEventListener('click', async () => {
-  if (!requireSelectedClip() || !state.currentBundle) return showToast('Empaqueta primero un SRT.', true);
-  releaseVideoPlayer();
-  try {
-    const res = await api('/api/translation/apply', {
-      method: 'POST',
-      body: JSON.stringify({
-        batch: state.selectedBatchId,
-        clip: state.selectedClipId,
-        bundle: state.currentBundle,
-        ass_style: document.getElementById('tr-style').value,
-        rerender: true,
-      }),
-    });
-    refreshQueue();
-    const warnMsg = res.warnings.length ? ` (${res.warnings.length} avisos)` : '';
-    showToast(`Traducción en cola para re-renderizar${warnMsg}`);
-  } catch (err) {
-    showToast(err.message, true);
-  }
-});
-
 // Publish
 document.getElementById('pub-approve-btn').addEventListener('click', async () => {
-  if (!requireSelectedClip()) return;
+  if (!state.selectedBatchId || !state.selectedClipId) return showToast('Selecciona un clip.', true);
   try {
     const platforms = Array.from(document.querySelectorAll('.pub-platform:checked')).map((el) => el.value);
     await api('/api/approve', {
@@ -991,19 +1126,16 @@ document.getElementById('pub-approve-btn').addEventListener('click', async () =>
       }),
     });
     refreshBatches();
-    showToast('Clip aprobado');
+    showToast('Clip aprobado para publicar');
   } catch (err) {
     showToast(err.message, true);
   }
 });
 
 document.getElementById('pub-queue-btn').addEventListener('click', async () => {
-  if (!state.selectedBatchId) return showToast('Selecciona un lote primero.', true);
+  if (!state.selectedBatchId) return showToast('Selecciona un proyecto.', true);
   try {
-    const res = await api('/api/queue', {
-      method: 'POST',
-      body: JSON.stringify({ batch: state.selectedBatchId }),
-    });
+    const res = await api('/api/queue', { method: 'POST', body: JSON.stringify({ batch: state.selectedBatchId }) });
     document.getElementById('pub-queue-result').textContent = res.message;
     showToast('publicacion.csv exportado');
   } catch (err) {
@@ -1011,14 +1143,11 @@ document.getElementById('pub-queue-btn').addEventListener('click', async () => {
   }
 });
 
-// Folders
+// Folders & Full Clean Shutdown
 document.querySelectorAll('.open-folder-btn').forEach((btn) => {
   btn.addEventListener('click', async () => {
     try {
-      const res = await api('/api/open-folder', {
-        method: 'POST',
-        body: JSON.stringify({ folder: btn.dataset.folder }),
-      });
+      const res = await api('/api/open-folder', { method: 'POST', body: JSON.stringify({ folder: btn.dataset.folder }) });
       showToast(`Abierto: ${res.opened}`);
     } catch (err) {
       showToast(err.message, true);
@@ -1029,16 +1158,16 @@ document.querySelectorAll('.open-folder-btn').forEach((btn) => {
 document.getElementById('refresh-sources-btn').addEventListener('click', refreshSources);
 document.getElementById('refresh-batches-btn').addEventListener('click', refreshBatches);
 document.getElementById('refresh-library-btn').addEventListener('click', refreshLibrary);
+
 document.getElementById('shutdown-btn').addEventListener('click', async () => {
   try {
     await api('/api/shutdown', { method: 'POST', body: '{}' });
-    showToast('Servidor local apagado. Puedes cerrar esta ventana.');
-  } catch (err) {
-    showToast(err.message, true);
-  }
+  } catch (_) {}
+  window.close();
+  document.body.innerHTML = '<div style="display:flex;height:100vh;align-items:center;justify-content:center;background:#07080b;color:#cbd5e1;font-family:Segoe UI,sans-serif;">Gevik Clip se cerró correctamente. Ya puedes cerrar esta pestaña.</div>';
 });
 
-// Initial load & live polling
+// Initial load & polling
 refreshStatus();
 refreshSources();
 refreshBatches();
