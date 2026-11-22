@@ -24,19 +24,12 @@
         <button class="nav-btn" data-tab="process">⚡ Generar Clips 9:16</button>
         <button class="nav-btn" data-tab="review">🎬 Revisar y Traducir</button>
         <button class="nav-btn" data-tab="publish">🚀 Aprobar y Publicar</button>
-        <button class="nav-btn" data-tab="library">📁 Biblioteca y Logs</button>
+        <button class="nav-btn" data-tab="library">📁 Biblioteca Local</button>
       </nav>
 
       <div class="sidebar-card">
         <div class="card-title">Agentes locales</div>
         <div id="agent-badges" class="badges"></div>
-      </div>
-
-      <div class="sidebar-card">
-        <div class="card-title">Actividad reciente</div>
-        <div id="job-list" class="job-list">
-          <div class="muted">Sin trabajos activos</div>
-        </div>
       </div>
 
       <div class="sidebar-footer">
@@ -47,12 +40,38 @@
     <main class="content">
       <div id="toast" class="toast hidden"></div>
 
+      <!-- PERSISTENT QUEUE BAR & LIVE STEP INDICATOR (visible across all tabs) -->
+      <div id="queue-bar" class="queue-bar">
+        <div class="queue-bar-main">
+          <div id="queue-jump-area" class="queue-indicator-left clickable" title="Haz clic para ir a Revisar y Traducir">
+            <span id="queue-dot" class="q-dot idle"></span>
+            <div>
+              <div id="queue-headline" class="queue-headline">Cola lista · Sin procesos en curso</div>
+              <div id="queue-detail" class="queue-detail">Cuando generes clips o grabes, verás aquí exactamente en qué paso va cada tarea.</div>
+            </div>
+          </div>
+          <div class="queue-indicator-right">
+            <button id="queue-go-review-btn" class="btn btn-primary btn-compact hidden">🎬 Ir a Revisar →</button>
+            <span id="queue-percent" class="queue-percent">0%</span>
+            <button id="queue-toggle-btn" class="btn btn-ghost btn-compact">📋 Cola (<span id="queue-count">0</span>)</button>
+          </div>
+        </div>
+        <div class="progress-track">
+          <div id="queue-progress-fill" class="progress-fill" style="width: 0%;"></div>
+        </div>
+        <div id="queue-drawer" class="queue-drawer hidden">
+          <div id="queue-items" class="queue-items">
+            <div class="muted">No hay tareas en la cola todavía.</div>
+          </div>
+        </div>
+      </div>
+
       <!-- TAB 1: WATCH LIVE + AUTO-CLIP + 1H-2H RECORDING -->
       <section id="tab-live" class="tab-panel active">
         <header class="panel-header">
           <div>
             <h2>📺 Ver Live, Grabar (1h–2h+) y Auto-Clip</h2>
-            <p class="muted">Pega un canal de Twitch, Kick o YouTube Live para verlo aquí mismo mientras se graba sin peso de CPU y saca clips automáticos cuando hay picos de reacción.</p>
+            <p class="muted">Mira Twitch, Kick o YouTube Live aquí mismo mientras se graba completo y saca clips automáticos ignorando cortes comerciales mudos.</p>
           </div>
           <div id="live-pill" class="pill pill-idle">INACTIVO</div>
         </header>
@@ -60,7 +79,7 @@
         <div class="card live-bar-card">
           <div class="live-url-row">
             <input id="live-url" type="url" placeholder="https://www.twitch.tv/canal  o  https://kick.com/canal  o  https://youtube.com/watch?v=..." />
-            <select id="live-quality" style="max-width:140px;">
+            <select id="live-quality" style="max-width:130px;">
               <option value="best">Máxima</option>
               <option value="1080">1080p</option>
               <option value="720">720p</option>
@@ -94,8 +113,6 @@
               <span>🎬 Pasar clips a 9:16 automáticamente</span>
             </label>
           </div>
-
-          <div id="live-error-banner" class="error-banner hidden"></div>
         </div>
 
         <div class="live-main-grid">
@@ -128,6 +145,8 @@
               </div>
             </div>
 
+            <div id="ad-break-pill" class="ad-banner hidden">🔇 Pausa muda / comercial detectado — auto-clip pausado automáticamente</div>
+
             <div class="clip-buttons">
               <button class="btn btn-accent live-cut-btn" data-seconds="30" disabled>⚡ Cortar 30s</button>
               <button class="btn btn-accent live-cut-btn" data-seconds="45" disabled>⚡ Cortar 45s</button>
@@ -137,7 +156,7 @@
 
             <div class="subhead">Clips de esta sesión (auto y manuales)</div>
             <div id="live-clips-list" class="list-box">
-              <div class="muted">Los clips manuales y automáticos aparecerán aquí y en <code>workspace/live_clips/</code>.</div>
+              <div class="muted">Los clips manuales y automáticos aparecerán aquí.</div>
             </div>
           </div>
         </div>
@@ -148,14 +167,14 @@
         <header class="panel-header">
           <div>
             <h2>⚡ Generar Clips Verticales (9:16)</h2>
-            <p class="muted">Flujo rápido local: elige un clip o grabación larga, selecciona un preset y genera clips listos con subtítulos dinámicos `.ass`.</p>
+            <p class="muted">ClipForge calcula automáticamente cuántos clips sacar (saltando comerciales mudos) y genera primero el clip #1 para que apruebes el marco de la cámara antes de renderizar el resto.</p>
           </div>
           <button id="refresh-sources-btn" class="btn btn-ghost">↻ Actualizar videos</button>
         </header>
 
         <div class="grid-2">
           <div class="card">
-            <h3>Generación Rápida</h3>
+            <h3>Generación Automática</h3>
 
             <div class="preset-row">
               <button type="button" class="preset-btn active" data-preset="gta-split">🎮 Stream + Cámara (Split-Cam)</button>
@@ -164,11 +183,11 @@
             </div>
 
             <div class="field">
-              <label for="proc-source">Video a procesar (haz clic en cualquier video de la derecha o pega la ruta)</label>
-              <input id="proc-source" type="text" placeholder="D:\Code\ClipForge\workspace\live_clips\..." />
+              <label for="proc-source">Video a procesar (clic en una grabación de la derecha o pega la ruta)</label>
+              <input id="proc-source" type="text" placeholder="D:\Code\ClipForge\workspace\live_recordings\..." />
             </div>
 
-            <div class="row-3">
+            <div class="row-2">
               <div class="field">
                 <label for="proc-language">Idioma del video</label>
                 <select id="proc-language">
@@ -178,7 +197,7 @@
                 </select>
               </div>
               <div class="field">
-                <label for="proc-caption-style">Estilo subtítulos</label>
+                <label for="proc-caption-style">Estilo de subtítulos</label>
                 <select id="proc-caption-style">
                   <option value="highlight" selected>highlight (Amarillo palabra a palabra)</option>
                   <option value="neon">neon (Gaming MAYÚSCULAS cian)</option>
@@ -186,14 +205,20 @@
                   <option value="srt">srt (Clásico)</option>
                 </select>
               </div>
-              <div class="field">
-                <label for="proc-count">Cantidad de clips</label>
-                <input id="proc-count" type="number" min="1" max="20" value="3" />
-              </div>
             </div>
 
+            <div class="cam-pick-bar">
+              <button type="button" id="proc-open-cropper-btn" class="btn btn-accent">✂️ Recortar cámara en fotograma</button>
+              <span id="proc-cam-status" class="muted">Cámara: detección automática (o recórtala tú mismo)</span>
+            </div>
+
+            <label class="checkbox-row" style="margin: 10px 0;">
+              <input id="proc-preview-first" type="checkbox" checked />
+              <span>🎯 <strong>Generar solo 1 clip inicial de prueba</strong> para validar el marco de cámara antes de renderizar todos los clips del stream</span>
+            </label>
+
             <details class="advanced-box">
-              <summary>Opciones avanzadas (cámara, modelo Whisper, duración y rangos)</summary>
+              <summary>Opciones avanzadas (cámara, cantidad manual, modelo Whisper, rangos)</summary>
               <div class="row-2" style="margin-top:10px;">
                 <div class="field">
                   <label for="proc-layout">Encuadre vertical</label>
@@ -217,6 +242,16 @@
               </div>
               <div class="row-3">
                 <div class="field">
+                  <label for="proc-count">Cantidad de clips</label>
+                  <select id="proc-count">
+                    <option value="0" selected>Automático (recomendado)</option>
+                    <option value="1">1 clip</option>
+                    <option value="3">3 clips</option>
+                    <option value="5">5 clips</option>
+                    <option value="10">10 clips</option>
+                  </select>
+                </div>
+                <div class="field">
                   <label for="proc-model">Modelo Whisper</label>
                   <select id="proc-model">
                     <option value="base" selected>base (rápido)</option>
@@ -225,17 +260,14 @@
                   </select>
                 </div>
                 <div class="field">
-                  <label for="proc-min">Mínimo (s)</label>
-                  <input id="proc-min" type="number" min="5" max="180" value="20" />
-                </div>
-                <div class="field">
-                  <label for="proc-max">Máximo (s)</label>
-                  <input id="proc-max" type="number" min="5" max="180" value="55" />
+                  <label for="proc-max">Duración máx (s)</label>
+                  <input id="proc-max" type="number" min="15" max="180" value="55" />
                 </div>
               </div>
+              <input id="proc-min" type="hidden" value="20" />
               <div class="field">
-                <label for="proc-ranges">Rangos manuales opcionales (uno por línea: INICIO,FIN)</label>
-                <textarea id="proc-ranges" rows="2" placeholder="Vacío = detección automática de mejores momentos"></textarea>
+                <label for="proc-ranges">Rangos manuales opcionales (INICIO,FIN uno por línea)</label>
+                <textarea id="proc-ranges" rows="2" placeholder="Vacío = selección automática"></textarea>
               </div>
               <label class="checkbox-row">
                 <input id="proc-denoise" type="checkbox" checked />
@@ -244,28 +276,56 @@
             </details>
 
             <div class="actions">
-              <button id="proc-start-btn" class="btn btn-primary" style="width:100%;padding:12px;">⚡ Generar Clips 9:16 Ahora</button>
+              <button id="proc-start-btn" class="btn btn-primary" style="width:100%;padding:12px;">⚡ Enviar a la Cola de Generación</button>
             </div>
           </div>
 
           <div class="card">
-            <h3>Tus Videos Disponibles (Live Clips, Lives y Fuentes)</h3>
+            <h3>Tus Grabaciones y Clips Disponibles</h3>
             <div id="sources-list" class="list-box tall">
-              <div class="muted">Aún no hay videos en tu carpeta local.</div>
+              <div class="muted">Aún no hay videos en tu biblioteca local.</div>
             </div>
           </div>
         </div>
       </section>
 
-      <!-- TAB 3: REVIEW & BILINGUAL SUBTITLES + CLAUDE/CODEX -->
+      <!-- TAB 3: REVIEW, CAMERA CALIBRATION & BILINGUAL SUBTITLES -->
       <section id="tab-review" class="tab-panel">
         <header class="panel-header">
           <div>
-            <h2>🎬 Revisar Clips, Traducir EN↔ES y Consultar Agentes</h2>
-            <p class="muted">Previsualiza el 9:16 real, edita traducciones sin mover timestamps y pide revisión a Claude Code o Codex.</p>
+            <h2>🎬 Revisar Clips, Aprobar Cámara y Traducir EN↔ES</h2>
+            <p class="muted">Revisa el 1er clip de prueba, ajusta la cámara si hace falta, aprueba para generar el resto y traduce subtítulos con apoyo de Claude/Codex.</p>
           </div>
           <button id="refresh-batches-btn" class="btn btn-ghost">↻ Actualizar lotes</button>
         </header>
+
+        <!-- CAMERA CALIBRATION APPROVAL BANNER -->
+        <div id="preview-approval-card" class="approval-banner hidden">
+          <div class="approval-banner-head">
+            <div>
+              <h3>🎯 Revisión del 1er Clip — Verifica el marco de la cámara</h3>
+              <p id="preview-approval-summary" class="muted"></p>
+            </div>
+            <button id="preview-continue-btn" class="btn btn-success">✅ Cámara OK — Generar clips restantes</button>
+          </div>
+          <div class="approval-controls">
+            <select id="preview-layout" style="max-width:195px;">
+              <option value="split-cam">split-cam (Webcam + Juego)</option>
+              <option value="face">face (Solo cara)</option>
+              <option value="fit">fit (Cuadro completo)</option>
+              <option value="center">center (Centrado)</option>
+            </select>
+            <button type="button" id="preview-open-cropper-btn" class="btn btn-primary">✂️ Recortar cámara en el fotograma</button>
+            <select id="preview-cam-preset" style="max-width:170px;">
+              <option value="auto">auto (OpenCV)</option>
+              <option value="bottom-right">Abajo derecha</option>
+              <option value="bottom-left">Abajo izquierda</option>
+              <option value="top-right">Arriba derecha</option>
+              <option value="top-left">Arriba izquierda</option>
+            </select>
+            <button id="preview-retest-btn" class="btn btn-accent">🔄 Probar en clip-01</button>
+          </div>
+        </div>
 
         <div class="review-layout">
           <div class="card">
@@ -325,7 +385,7 @@
             </div>
 
             <div id="agent-report-box" class="agent-report hidden">
-              <div class="subhead">Respuesta del agente (guardada en `.agents/handoffs/`)</div>
+              <div class="subhead">Respuesta del agente</div>
               <pre id="agent-report-text"></pre>
             </div>
           </div>
@@ -381,49 +441,68 @@
         </div>
       </section>
 
-      <!-- TAB 5: LOCAL WORKSPACE LIBRARY & LOGS -->
+      <!-- TAB 5: CLEAN LOCAL LIBRARY (logs stay on disk in workspace/logs/) -->
       <section id="tab-library" class="tab-panel">
         <header class="panel-header">
           <div>
-            <h2>📁 Biblioteca Local y Logs de Errores</h2>
+            <h2>📁 Biblioteca Local</h2>
             <p id="workspace-root-path" class="muted">Carpeta local: cargando...</p>
           </div>
           <div class="actions" style="margin:0;">
             <button id="refresh-library-btn" class="btn btn-ghost">↻ Actualizar</button>
-            <button class="btn btn-primary open-folder-btn" data-folder="root">📂 Abrir workspace/</button>
+            <button class="btn btn-primary open-folder-btn" data-folder="root">📂 Abrir carpeta workspace/</button>
           </div>
         </header>
 
         <div class="folder-pills">
-          <button class="btn btn-ghost open-folder-btn" data-folder="live_recordings">🎥 Abrir live_recordings/ (1h–2h)</button>
-          <button class="btn btn-ghost open-folder-btn" data-folder="live_clips">⚡ Abrir live_clips/</button>
-          <button class="btn btn-ghost open-folder-btn" data-folder="rendered_clips">📱 Abrir rendered_clips/ (9:16)</button>
-          <button class="btn btn-ghost open-folder-btn" data-folder="logs">📋 Abrir logs/</button>
-        </div>
-
-        <div class="grid-2" style="margin-bottom:18px;">
-          <div class="card">
-            <h3>🎥 Grabaciones Completas de Lives (1h / 2h+)</h3>
-            <div id="lib-recordings" class="list-box"></div>
-          </div>
-          <div class="card">
-            <h3>⚡ Clips Sacados en Vivo (Auto / Manual)</h3>
-            <div id="lib-live-clips" class="list-box"></div>
-          </div>
+          <button class="btn btn-ghost open-folder-btn" data-folder="live_recordings">🎥 Grabaciones de Lives (1h–2h)</button>
+          <button class="btn btn-ghost open-folder-btn" data-folder="live_clips">⚡ Clips en Vivo</button>
+          <button class="btn btn-ghost open-folder-btn" data-folder="rendered_clips">📱 Clips 9:16 Renderizados</button>
         </div>
 
         <div class="grid-2">
           <div class="card">
-            <h3>🚨 Errores Guardados (<code>workspace/logs/errors.jsonl</code>)</h3>
-            <div id="errors-list" class="list-box tall"></div>
+            <h3>🎥 Grabaciones Completas de Lives (1h / 2h+)</h3>
+            <div id="lib-recordings" class="list-box tall"></div>
           </div>
           <div class="card">
-            <h3>📋 Log del Sistema (<code>workspace/logs/clipforge.log</code>)</h3>
-            <pre id="system-log-box" class="log-pre"></pre>
+            <h3>⚡ Clips Sacados en Vivo (Auto / Manual)</h3>
+            <div id="lib-live-clips" class="list-box tall"></div>
           </div>
         </div>
       </section>
     </main>
+  </div>
+
+  <!-- INTERACTIVE SNIPPING-TOOL WEBCAM CROPPER MODAL -->
+  <div id="cropper-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h3>✂️ Selecciona el recuadro de la cámara del streamer</h3>
+          <p class="muted">Haz clic y arrastra sobre el fotograma (igual que Recortes de Windows) para marcar exactamente dónde está tu cámara.</p>
+        </div>
+        <button type="button" id="cropper-close-btn" class="btn btn-ghost btn-compact">✕</button>
+      </div>
+
+      <div class="cropper-stage-wrap">
+        <div id="cropper-stage" class="cropper-stage">
+          <img id="cropper-img" alt="Fotograma del stream" draggable="false" />
+          <canvas id="cropper-canvas"></canvas>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <button type="button" id="cropper-next-frame-btn" class="btn btn-ghost">🎲 Otro fotograma (+15s)</button>
+          <span id="cropper-coords-label" class="muted">Arrastra con el mouse sobre la cámara...</span>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button type="button" id="cropper-cancel-btn" class="btn btn-ghost">Cancelar</button>
+          <button type="button" id="cropper-apply-btn" class="btn btn-primary" disabled>✅ Usar este recorte</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="/static/app.js"></script>

@@ -1,6 +1,6 @@
 """Localhost-only HTTP backend for the ClipForge Desktop Studio app."""
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -18,7 +18,18 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlparse
 
 from clipforge import __version__
-from clipforge.cli import LAYOUTS, approve, process, queue, read_run, rerender, translate_apply, translate_pack
+from clipforge.cli import (
+    LAYOUTS,
+    approve,
+    continue_batch,
+    process,
+    queue,
+    read_run,
+    rerender,
+    retest_preview_clip,
+    translate_apply,
+    translate_pack,
+)
 from clipforge.config import (
     DEFAULT_OUTPUTS_DIR,
     DEFAULT_SOURCES_DIR,
@@ -29,13 +40,14 @@ from clipforge.desktop.jobs import JobManager
 from clipforge.logging_utils import (
     configure_logging,
     ensure_safe_stdio,
+    log_event,
     log_info,
     read_recent_errors,
     read_recent_logs,
     record_error,
 )
 from clipforge.pipeline.live import LiveRecorder, parse_stream_embed
-from clipforge.pipeline.media import NO_WINDOW_FLAGS
+from clipforge.pipeline.media import NO_WINDOW_FLAGS, extract_frame_jpg, probe
 from clipforge.pipeline.subtitles import CAPTION_STYLES
 from clipforge.publishing.publication import PLATFORMS, save_json
 from clipforge.storage import resolve_workspace
@@ -69,7 +81,7 @@ class ClipForgeAppState:
             'layout': 'split-cam',
             'cam_region': 'auto',
             'caption_style': 'highlight',
-            'language': 'es',
+            'language': 'auto',
             'model': 'base',
             'denoise': True,
         }
@@ -77,21 +89,24 @@ class ClipForgeAppState:
     def _scan_videos(self, folders: list[Path], limit: int = 40) -> list[dict]:
         items: list[dict] = []
         seen: set[str] = set()
-        candidates: list[tuple[float, Path, Path]] = []
+        candidates: list[tuple[float, int, Path, Path]] = []
         for base in folders:
             if not base.is_dir():
                 continue
-            for path in base.rglob('*'):
-                if not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
-                    continue
-                if '_buffer' in path.parts:
-                    continue
-                try:
-                    mtime = path.stat().st_mtime
-                except OSError:
-                    continue
-                candidates.append((mtime, path.resolve(), base.resolve()))
-        for _, path, base in sorted(candidates, key=lambda item: item[0], reverse=True):
+            base_resolved = base.resolve()
+            for dirpath, dirnames, filenames in os.walk(base_resolved):
+                # Skip live rolling segment buffers before descending so os.walk stays fast and lock-free
+                dirnames[:] = [d for d in dirnames if d != '_buffer']
+                for name in filenames:
+                    if Path(name).suffix.lower() not in VIDEO_EXTS or name.startswith('.tmp-'):
+                        continue
+                    path = (Path(dirpath) / name).resolve()
+                    try:
+                        st = path.stat()
+                    except OSError:
+                        continue
+                    candidates.append((st.st_mtime, st.st_size, path, base_resolved))
+        for _, size_bytes, path, base in sorted(candidates, key=lambda item: item[0], reverse=True):
             key = str(path)
             if key in seen:
                 continue
@@ -109,7 +124,7 @@ class ClipForgeAppState:
                 'name': path.name,
                 'path': key,
                 'relative': path.relative_to(base).as_posix(),
-                'size_mb': round(path.stat().st_size / (1024 * 1024), 2),
+                'size_mb': round(size_bytes / (1024 * 1024), 2),
                 'mode': meta.get('mode', ''),
                 'reason': meta.get('reason', ''),
                 'platform': meta.get('platform', ''),
@@ -130,8 +145,8 @@ class ClipForgeAppState:
     def list_sources(self) -> list[dict]:
         return self._scan_videos(
             [
-                self.workspace.live_clips_dir,
                 self.workspace.live_recordings_dir,
+                self.workspace.live_clips_dir,
                 self.workspace.sources_dir,
                 self.legacy_sources_dir,
             ],
@@ -176,7 +191,11 @@ class ClipForgeAppState:
                 'id': folder.name,
                 'path': str(folder),
                 'source': manifest.get('source', ''),
-                'rights': manifest.get('rights', {}),
+                'status': manifest.get('status', 'complete'),
+                'planned_total': manifest.get('planned_total', len(enriched)),
+                'remaining_count': manifest.get('remaining_count', 0),
+                'muted_ranges': manifest.get('muted_ranges', []),
+                'has_plan': (folder / 'plan.json').is_file(),
                 'has_queue': (folder / 'publicacion.csv').is_file(),
                 'clips': enriched,
             })
@@ -211,16 +230,21 @@ class ClipForgeAppState:
             raise ValueError(f'No se encontró el archivo: {source_path}')
         ranges_raw = str(data.get('ranges') or '').strip()
         ranges = [line.strip() for line in ranges_raw.splitlines() if line.strip()] if ranges_raw else []
+        raw_count = data.get('count', 0)
+        count = 0 if str(raw_count).strip().lower() in {'', 'auto', '0', 'none'} else int(raw_count)
+        preview_first = bool(data.get('preview_first', True))
+
         args = SimpleNamespace(
             source=source_path,
             output=self.outputs_dir,
-            count=int(data.get('count') or 3),
+            count=count,
             min_seconds=int(data.get('min_seconds') or 20),
             max_seconds=int(data.get('max_seconds') or 55),
             range=ranges,
             layout=str(data.get('layout') or 'split-cam'),
             cam_region=str(data.get('cam_region') or 'auto'),
             caption_style=str(data.get('caption_style') or 'highlight'),
+            preview_first=preview_first,
             srt=Path(data['srt']) if data.get('srt') else None,
             skip_asr=bool(data.get('skip_asr', False)),
             model=str(data.get('model') or 'base'),
@@ -231,25 +255,19 @@ class ClipForgeAppState:
             rights_note=str(data.get('rights_note') or ''),
         )
 
-        def run_process(log):
-            log(f'Procesando {source_path.name} ({args.layout} · {args.caption_style} · whisper={args.model})...')
-            _, out_text = _run_capturing_io(lambda: process(args), log)
-            last_line = out_text.splitlines()[-1] if out_text else ''
-            return {'batch_path': last_line, 'batch_id': Path(last_line).name if last_line else ''}
+        def run_process(progress):
+            folder = process(args, progress_cb=progress)
+            manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
+            return {
+                'batch_path': str(folder),
+                'batch_id': folder.name,
+                'status': manifest.get('status', 'complete'),
+                'planned_total': manifest.get('planned_total', len(manifest.get('clips', []))),
+                'remaining_count': manifest.get('remaining_count', 0),
+            }
 
-        return self.jobs.submit('process', f'Procesar {source_path.name}', run_process)
-
-
-def _run_capturing_io(fn, log_cb):
-    out_buf = io.StringIO()
-    err_buf = io.StringIO()
-    with redirect_stdout(out_buf), redirect_stderr(err_buf):
-        result = fn()
-    for text in (out_buf.getvalue(), err_buf.getvalue()):
-        for line in text.splitlines():
-            if line.strip():
-                log_cb(line.strip())
-    return result, out_buf.getvalue().strip()
+        mode_tag = '1er clip prueba' if preview_first else ('Auto clips' if count == 0 else f'{count} clips')
+        return self.jobs.submit('process', f'{source_path.name} ({mode_tag})', run_process)
 
 
 def make_handler(state: ClipForgeAppState):
@@ -321,23 +339,27 @@ def make_handler(state: ClipForgeAppState):
 
             length = end - start + 1
             mime = mimetypes.guess_type(path.name)[0] or 'video/mp4'
-            self.send_response(status)
-            self.send_header('Content-Type', mime)
-            self.send_header('Accept-Ranges', 'bytes')
-            self.send_header('Content-Length', str(length))
-            self.send_header('Cache-Control', 'no-store')
-            if status == HTTPStatus.PARTIAL_CONTENT:
-                self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
-            self.end_headers()
-            with path.open('rb') as handle:
-                handle.seek(start)
-                remaining = length
-                while remaining > 0:
-                    chunk = handle.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
+            try:
+                self.send_response(status)
+                self.send_header('Content-Type', mime)
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Content-Length', str(length))
+                self.send_header('Cache-Control', 'no-store')
+                if status == HTTPStatus.PARTIAL_CONTENT:
+                    self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+                self.end_headers()
+                with path.open('rb') as handle:
+                    handle.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = handle.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                # Normal when the browser <video> element seeks or cancels a range read.
+                return
 
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
@@ -392,7 +414,7 @@ def make_handler(state: ClipForgeAppState):
                     self._send_json({'batches': state.list_batches()})
                     return
                 if path == '/api/jobs':
-                    self._send_json({'jobs': state.jobs.list_all()})
+                    self._send_json(state.jobs.snapshot())
                     return
                 if path.startswith('/api/jobs/'):
                     job_id = path.split('/')[-1]
@@ -412,6 +434,30 @@ def make_handler(state: ClipForgeAppState):
                     _, clip_dir = state.resolve_clip_dir(batch_id, clip_id)
                     self._serve_video_file(clip_dir / 'video.mp4')
                     return
+                if path == '/api/frame':
+                    qs = parse_qs(parsed.query)
+                    batch_id = unquote((qs.get('batch') or [''])[0]).strip()
+                    source_raw = unquote((qs.get('source') or [''])[0]).strip()
+                    offset = float((qs.get('t') or ['0'])[0] or 0)
+                    if batch_id:
+                        folder = state.resolve_batch_dir(batch_id)
+                        manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
+                        source_path = Path(manifest['source']).resolve(strict=True)
+                        base_ts = float(manifest['clips'][0]['start']) if manifest.get('clips') else 0.0
+                        info = probe(source_path)
+                        ts = max(0.0, min(max(0.0, info.duration - 0.5), base_ts + offset))
+                    elif source_raw:
+                        source_path = Path(source_raw).resolve(strict=True)
+                        if source_path.suffix.lower() not in VIDEO_EXTS:
+                            raise ValueError('Archivo de video no soportado para fotograma.')
+                        info = probe(source_path)
+                        ts = max(0.0, min(max(0.0, info.duration - 0.5), offset if offset > 0 else min(5.0, info.duration * 0.25)))
+                    else:
+                        raise ValueError('Indica batch o source para capturar el fotograma.')
+                    frame_cache = state.workspace.root / '_frame_preview.jpg'
+                    extract_frame_jpg(source_path, ts, frame_cache)
+                    self._send_bytes(frame_cache.read_bytes(), 'image/jpeg')
+                    return
                 if path == '/api/translation':
                     qs = parse_qs(parsed.query)
                     batch_id = unquote((qs.get('batch') or [''])[0])
@@ -427,6 +473,8 @@ def make_handler(state: ClipForgeAppState):
                     self._send_json({'exists': False, 'has_srt': srt_path.is_file(), 'bundle': None})
                     return
                 self._send_json({'error': 'Ruta no encontrada.'}, HTTPStatus.NOT_FOUND)
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                return
             except FileNotFoundError as exc:
                 self._send_json({'error': str(exc)}, HTTPStatus.NOT_FOUND)
             except ValueError as exc:
@@ -470,6 +518,7 @@ def make_handler(state: ClipForgeAppState):
                                 'language': state.auto_process_config['language'],
                                 'model': state.auto_process_config['model'],
                                 'count': 1,
+                                'preview_first': False,
                                 'min_seconds': max(10, min(record.window_seconds, 20)),
                                 'max_seconds': max(record.window_seconds, 60),
                                 'denoise': state.auto_process_config['denoise'],
@@ -515,6 +564,7 @@ def make_handler(state: ClipForgeAppState):
                             'language': data.get('language') or state.auto_process_config['language'],
                             'model': data.get('model') or state.auto_process_config['model'],
                             'count': 1,
+                            'preview_first': False,
                             'min_seconds': max(10, min(window, 20)),
                             'max_seconds': max(window, 60),
                             'denoise': bool(data.get('denoise', True)),
@@ -542,6 +592,46 @@ def make_handler(state: ClipForgeAppState):
                     return
                 if path == '/api/process':
                     job = state.submit_process_job(data)
+                    self._send_json({'job': job.to_dict()}, HTTPStatus.ACCEPTED)
+                    return
+                if path == '/api/batch/retest-preview':
+                    batch_id = str(data.get('batch') or '')
+                    folder = state.resolve_batch_dir(batch_id)
+                    layout = str(data.get('layout') or '') or None
+                    cam_region = str(data.get('cam_region') or '') or None
+                    caption_style = str(data.get('caption_style') or '') or None
+
+                    def run_retest(progress):
+                        manifest = retest_preview_clip(
+                            folder,
+                            layout=layout,
+                            cam_region_spec=cam_region,
+                            caption_style=caption_style,
+                            progress_cb=progress,
+                        )
+                        return {'batch_id': batch_id, 'status': manifest.get('status')}
+
+                    job = state.jobs.submit('retest-preview', f'Probar cámara {batch_id}/clip-01', run_retest)
+                    self._send_json({'job': job.to_dict()}, HTTPStatus.ACCEPTED)
+                    return
+                if path == '/api/batch/continue':
+                    batch_id = str(data.get('batch') or '')
+                    folder = state.resolve_batch_dir(batch_id)
+                    layout = str(data.get('layout') or '') or None
+                    cam_region = str(data.get('cam_region') or '') or None
+                    caption_style = str(data.get('caption_style') or '') or None
+
+                    def run_continue(progress):
+                        manifest = continue_batch(
+                            folder,
+                            layout=layout,
+                            cam_region_spec=cam_region,
+                            caption_style=caption_style,
+                            progress_cb=progress,
+                        )
+                        return {'batch_id': batch_id, 'clips_count': len(manifest.get('clips', []))}
+
+                    job = state.jobs.submit('continue-batch', f'Generar resto de {batch_id}', run_continue)
                     self._send_json({'job': job.to_dict()}, HTTPStatus.ACCEPTED)
                     return
                 if path == '/api/translation/pack':
@@ -608,22 +698,21 @@ def make_handler(state: ClipForgeAppState):
 
                     job_dict = None
                     if do_rerender:
-                        job = state.jobs.submit(
-                            'rerender',
-                            f'Re-render {batch_id}/{clip_id} ({target_lang} · {ass_style})',
-                            lambda log: _run_capturing_io(
-                                lambda: rerender(SimpleNamespace(
-                                    run=folder,
-                                    clip=clip_id,
-                                    srt=out_srt,
-                                    caption_style=ass_style,
-                                    layout=layout,
-                                    cam_region=data.get('cam_region') or None,
-                                    denoise=bool(data.get('denoise', False)),
-                                )),
-                                log,
-                            )[1],
-                        )
+                        def run_rerender(progress):
+                            progress('Re-renderizando', 40, f'Quemando subtítulos ({target_lang} · {ass_style})...')
+                            rerender(SimpleNamespace(
+                                run=folder,
+                                clip=clip_id,
+                                srt=out_srt,
+                                caption_style=ass_style,
+                                layout=layout,
+                                cam_region=data.get('cam_region') or None,
+                                denoise=bool(data.get('denoise', False)),
+                            ))
+                            progress('Completado', 100, f'{clip_id} actualizado')
+                            return {'batch_id': batch_id, 'clip_id': clip_id}
+
+                        job = state.jobs.submit('rerender', f'Re-render {batch_id}/{clip_id}', run_rerender)
                         job_dict = job.to_dict()
                     self._send_json({'srt': str(out_srt), 'warnings': warnings, 'job': job_dict})
                     return
@@ -642,8 +731,8 @@ def make_handler(state: ClipForgeAppState):
                     if not target_file.is_file():
                         raise ValueError('No hay archivo de subtítulos ni paquete de traducción para revisar.')
 
-                    def run_review(log):
-                        log(f'Enviando {target_file.name} a {agent}...')
+                    def run_review(progress):
+                        progress(f'Consultando {agent}', 30, f'Enviando {target_file.name} a {agent}...')
                         completed = subprocess.run(
                             [
                                 sys.executable,
@@ -663,9 +752,6 @@ def make_handler(state: ClipForgeAppState):
                             creationflags=NO_WINDOW_FLAGS,
                             check=False,
                         )
-                        if completed.stdout.strip():
-                            for line in completed.stdout.splitlines():
-                                log(line)
                         if completed.returncode != 0:
                             raise RuntimeError(completed.stderr.strip() or f'{agent} devolvió código {completed.returncode}')
                         handoff_paths = re.findall(r'guardado en (.+)$', completed.stdout, flags=re.M)
@@ -674,6 +760,7 @@ def make_handler(state: ClipForgeAppState):
                             p = Path(hp.strip())
                             if p.is_file():
                                 reports.append({'path': str(p), 'content': p.read_text(encoding='utf-8')})
+                        progress('Completado', 100, f'Revisión de {agent} lista')
                         return {'reports': reports}
 
                     job = state.jobs.submit('agent-review', f'Revisión {agent} · {batch_id}/{clip_id}', run_review)
@@ -707,12 +794,14 @@ def make_handler(state: ClipForgeAppState):
                     self._send_json({'message': buf.getvalue().strip(), 'csv': str(folder / 'publicacion.csv')})
                     return
                 if path == '/api/shutdown':
-                    log_info('server', 'Apagado solicitado desde la UI', state.workspace.logs_dir)
+                    log_event('server', 'shutdown_requested', {}, logs_dir=state.workspace.logs_dir)
                     state.recorder.stop()
                     state.shutdown_event.set()
                     self._send_json({'ok': True})
                     return
                 self._send_json({'error': 'Endpoint no encontrado.'}, HTTPStatus.NOT_FOUND)
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                return
             except FileNotFoundError as exc:
                 self._send_json({'error': str(exc)}, HTTPStatus.NOT_FOUND)
             except ValueError as exc:

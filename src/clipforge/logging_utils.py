@@ -1,7 +1,10 @@
-"""Persistent rotating text logs + structured JSONL error log for ClipForge.
+"""Persistent rotating text logs + structured JSONL event & error logs for ClipForge.
 
-Also protects headless Windows launches (`pythonw.exe`) where `sys.stdout` and `sys.stderr`
-are `None`, preventing crashes inside libraries like `tqdm` / `huggingface_hub` / `faster-whisper`.
+Logs live on disk (`workspace/logs/`) so engineers and agents can diagnose any run
+without cluttering the desktop UI:
+  - clipforge.log   detailed human-readable rotating log (INFO/WARNING/ERROR + tracebacks)
+  - events.jsonl    structured telemetry per stage (probe, ad-breaks, whisper, cam-box, render)
+  - errors.jsonl    structured real errors with context and full tracebacks
 """
 
 from datetime import datetime, timezone
@@ -52,10 +55,9 @@ def configure_logging(logs_dir: Path) -> logging.Logger:
     with _LOCK:
         _ACTIVE_LOGS_DIR = logs_dir
         logger = logging.getLogger(_LOGGER_NAME)
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.DEBUG)
         logger.propagate = False
 
-        # Avoid duplicating file handlers pointing to the same path
         target_str = str(log_file)
         for handler in list(logger.handlers):
             if isinstance(handler, RotatingFileHandler) and getattr(handler, 'baseFilename', '') == target_str:
@@ -65,7 +67,7 @@ def configure_logging(logs_dir: Path) -> logging.Logger:
 
         file_handler = RotatingFileHandler(
             log_file,
-            maxBytes=5 * 1024 * 1024,
+            maxBytes=10 * 1024 * 1024,
             backupCount=5,
             encoding='utf-8',
             delay=True,
@@ -96,6 +98,34 @@ def log_info(source: str, message: str, logs_dir: Path | None = None):
     logger.info('[%s] %s', source, message)
 
 
+def log_event(
+    source: str,
+    event: str,
+    details: dict[str, Any] | None = None,
+    *,
+    logs_dir: Path | None = None,
+) -> dict:
+    """Write a rich structured telemetry event to clipforge.log and events.jsonl."""
+    target_dir = logs_dir or _ACTIVE_LOGS_DIR
+    entry = {
+        'timestamp': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'source': source,
+        'event': event,
+        'details': details or {},
+    }
+    if target_dir is not None:
+        target_dir = target_dir.resolve()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        logger = configure_logging(target_dir)
+        summary = json.dumps(entry['details'], ensure_ascii=False) if entry['details'] else ''
+        logger.info('[%s:%s] %s', source, event, summary)
+        events_file = target_dir / 'events.jsonl'
+        with _LOCK:
+            with events_file.open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    return entry
+
+
 def record_error(
     source: str,
     error: BaseException | str,
@@ -111,7 +141,7 @@ def record_error(
 
     is_exc = isinstance(error, BaseException)
     error_type = type(error).__name__ if is_exc else 'Error'
-    message = str(error) if is_exc else str(error)
+    message = str(error)
     tb = ''.join(traceback.format_exception(type(error), error, error.__traceback__)) if is_exc else ''
 
     entry = {

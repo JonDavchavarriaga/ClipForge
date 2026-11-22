@@ -5,6 +5,7 @@ import shutil
 from statistics import median
 import subprocess
 import sys
+import time
 import wave
 from array import array
 from dataclasses import dataclass
@@ -290,7 +291,27 @@ def _caption_filter(has_captions: bool, captions_file: Path | None) -> str | Non
     return None
 
 
+def extract_frame_jpg(source: Path, timestamp_sec: float, destination: Path) -> Path:
+    """Extract a single JPEG frame at timestamp_sec so the user can visually select the webcam box."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    safe_ts = max(0.0, float(timestamp_sec))
+    run([
+        '-ss', f'{safe_ts:.3f}',
+        '-i', source,
+        '-frames:v', '1',
+        '-vf', 'scale=min(1280\\,iw):-2',
+        '-q:v', '3',
+        '-y',
+        destination,
+    ])
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise ValueError('No se pudo extraer un fotograma de este video en el tiempo indicado.')
+    return destination
+
+
 def render(source, target, start, end, track, layout, has_captions, denoise, *, captions_file=None, cam_region=None):
+    target = Path(target)
+    temp_target = target.with_name(f'.tmp-{target.name}')
     caption_step = _caption_filter(has_captions, captions_file)
     args = ['-ss', f'{start:.6f}', '-i', source, '-t', f'{end - start:.6f}']
 
@@ -338,5 +359,16 @@ def render(source, target, start, end, track, layout, has_captions, denoise, *, 
         args.extend(['-map', f'0:a:{track}', '-af', ','.join(effects), '-c:a', 'aac', '-b:a', '160k', '-ar', '48000'])
 
     args.extend(['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast',
-                 '-crf', '21', '-movflags', '+faststart', target])
-    run(args, cwd=target.parent)
+                 '-crf', '21', '-movflags', '+faststart', '-y', temp_target])
+    try:
+        run(args, cwd=target.parent)
+        for attempt in range(6):
+            try:
+                temp_target.replace(target)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.2)
+    finally:
+        temp_target.unlink(missing_ok=True)

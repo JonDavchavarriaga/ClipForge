@@ -24,7 +24,7 @@ import time
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
-from clipforge.logging_utils import log_info, record_error
+from clipforge.logging_utils import log_event, log_info, record_error
 from clipforge.pipeline.media import NO_WINDOW_FLAGS, ffmpeg, run as run_ffmpeg
 from clipforge.publishing.publication import save_json
 
@@ -33,6 +33,7 @@ SENSITIVITY_DB = {
     'medium': 3.8,
     'high': 2.4,
 }
+MUTED_AD_DB = -52.0
 
 
 def detect_platform(url: str) -> str:
@@ -276,6 +277,8 @@ class LiveRecorder:
         self._full_recording_path: str = ''
         self._last_error: str = ''
         self._last_db: float = -60.0
+        self._in_ad_break: bool = False
+        self._muted_segments_count: int = 0
 
     def is_running(self) -> bool:
         with self._lock:
@@ -416,6 +419,8 @@ class LiveRecorder:
         pending_spike_at: float | None = None
         pending_reason = ''
         last_auto_clip_at = 0.0
+        consecutive_muted = 0
+        post_ad_warmup = 0
         tail_wait = max(self.segment_seconds * 2, 10)
 
         while not self._stop_event.wait(timeout=max(2, self.segment_seconds // 2)):
@@ -432,7 +437,6 @@ class LiveRecorder:
                 continue
 
             completed = self._completed_segments()
-            # Prune only when not saving the full 1h-2h recording
             if not save_full and len(completed) > max_segments:
                 for old in completed[: len(completed) - max_segments]:
                     try:
@@ -440,7 +444,7 @@ class LiveRecorder:
                     except OSError:
                         pass
 
-            if not auto_on or not completed:
+            if not completed:
                 continue
 
             newest = completed[-1]
@@ -453,20 +457,49 @@ class LiveRecorder:
                     continue
                 with self._lock:
                     self._last_db = round(db, 1)
-                triggered, delta = detect_audio_spike(db, baseline, sensitivity=sensitivity)
-                baseline.append(db)
-                now = time.monotonic()
-                if triggered and pending_spike_at is None and (now - last_auto_clip_at) >= cooldown:
-                    pending_spike_at = now
-                    pending_reason = f'Auto-clip por pico de reacción (+{delta:.1f} dB)'
-                    log_info('live.autoclip', f'Pico detectado ({db:.1f} dB, +{delta:.1f} dB); esperando cola...', self.logs_dir)
 
-            if pending_spike_at is not None and (time.monotonic() - pending_spike_at) >= tail_wait:
+                # Detect Twitch commercial / muted audio breaks so they never trigger fake clips
+                if db <= MUTED_AD_DB:
+                    consecutive_muted += 1
+                    with self._lock:
+                        self._muted_segments_count += 1
+                    if consecutive_muted == 2:
+                        with self._lock:
+                            self._in_ad_break = True
+                        pending_spike_at = None
+                        log_event('live', 'ad_break_muted_start', {'segment': newest.name, 'db': round(db, 1)}, logs_dir=self.logs_dir)
+                    continue
+
+                if consecutive_muted >= 2:
+                    with self._lock:
+                        self._in_ad_break = False
+                    # Ignore first 2 segments after ad break so returning audio doesn't look like a scream spike
+                    post_ad_warmup = 2
+                    log_event('live', 'ad_break_muted_end', {'segment': newest.name, 'muted_chunks': consecutive_muted, 'db': round(db, 1)}, logs_dir=self.logs_dir)
+                consecutive_muted = 0
+
+                if post_ad_warmup > 0:
+                    post_ad_warmup -= 1
+                    baseline.append(db)
+                    continue
+
+                if auto_on:
+                    triggered, delta = detect_audio_spike(db, baseline, sensitivity=sensitivity)
+                    baseline.append(db)
+                    now = time.monotonic()
+                    if triggered and pending_spike_at is None and (now - last_auto_clip_at) >= cooldown:
+                        pending_spike_at = now
+                        pending_reason = f'Auto-clip por pico de reacción (+{delta:.1f} dB)'
+                        log_event('live', 'autoclip_spike', {'db': round(db, 1), 'delta_db': delta, 'segment': newest.name}, logs_dir=self.logs_dir)
+                else:
+                    baseline.append(db)
+
+            if auto_on and pending_spike_at is not None and (time.monotonic() - pending_spike_at) >= tail_wait:
                 pending_spike_at = None
                 last_auto_clip_at = time.monotonic()
                 try:
                     record = self.save_clip(auto_secs, mode='auto', reason=pending_reason)
-                    log_info('live.autoclip', f'Auto-clip guardado: {record.path}', self.logs_dir)
+                    log_event('live', 'autoclip_saved', {'clip_id': record.clip_id, 'path': record.path, 'reason': pending_reason}, logs_dir=self.logs_dir)
                     if callback is not None:
                         callback(record)
                 except Exception as exc:
@@ -604,6 +637,8 @@ class LiveRecorder:
                 'auto_clip_seconds': self._auto_clip_seconds,
                 'auto_sensitivity': self._auto_sensitivity,
                 'last_db': self._last_db,
+                'in_ad_break': self._in_ad_break,
+                'muted_segments_count': self._muted_segments_count,
                 'last_error': self._last_error,
                 'session_dir': str(self._session_dir) if self._session_dir else '',
                 'elapsed_seconds': elapsed,

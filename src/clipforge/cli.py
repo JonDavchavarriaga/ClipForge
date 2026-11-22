@@ -6,10 +6,23 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
-from clipforge.pipeline.highlights import Candidate, clip_cues, make_srt, read_srt, seconds, suggest
+from clipforge.logging_utils import log_event
+from clipforge.pipeline.highlights import (
+    Candidate,
+    Cue,
+    WordTiming,
+    clip_cues,
+    detect_muted_ranges,
+    make_srt,
+    read_srt,
+    seconds,
+    suggest,
+)
 from clipforge.pipeline.live import LiveRecorder
 from clipforge.pipeline.media import (
     CamRegion,
@@ -42,6 +55,12 @@ from clipforge.publishing.publication import (
 )
 
 LAYOUTS = ('face', 'center', 'fit', 'split-cam')
+ProgressFn = Callable[[str, int, str], None]
+
+
+def _emit(progress_cb: ProgressFn | None, stage: str, percent: int, detail: str):
+    if progress_cb is not None:
+        progress_cb(stage, max(0, min(100, int(percent))), detail)
 
 
 def provenance(args):
@@ -95,91 +114,264 @@ def _serialize_cam(region: CamRegion | None) -> dict | None:
     return {'x': region.x, 'y': region.y, 'w': region.w, 'h': region.h}
 
 
-def process(args):
+def _deserialize_cam(raw: dict | None) -> CamRegion | None:
+    if not raw:
+        return None
+    return CamRegion(float(raw['x']), float(raw['y']), float(raw['w']), float(raw['h']))
+
+
+def _serialize_cues(cues: list[Cue]) -> list[dict]:
+    return [
+        {
+            'start': round(c.start, 3),
+            'end': round(c.end, 3),
+            'text': c.text,
+            'words': [{'start': round(w.start, 3), 'end': round(w.end, 3), 'text': w.text} for w in c.words],
+        }
+        for c in cues
+    ]
+
+
+def _deserialize_cues(raw_cues: list[dict]) -> list[Cue]:
+    items: list[Cue] = []
+    for c in raw_cues:
+        words = tuple(WordTiming(float(w['start']), float(w['end']), str(w['text'])) for w in (c.get('words') or []))
+        items.append(Cue(float(c['start']), float(c['end']), str(c['text']), words))
+    return items
+
+
+def _render_single_candidate(
+    source: Path,
+    folder: Path,
+    index: int,
+    candidate: Candidate,
+    cues: list[Cue],
+    track: int | None,
+    layout_requested: str,
+    requested_cam: CamRegion | None,
+    caption_style: str,
+    denoise: bool,
+) -> dict:
+    clip_id = f'clip-{index:02}'
+    clip_dir = folder / clip_id
+    clip_dir.mkdir(exist_ok=True)
+    layout = layout_requested
+    cam_region = None
+    if layout == 'face':
+        found = face_commands(source, candidate.start, candidate.end - candidate.start, clip_dir / 'follow.txt')
+        if not found:
+            layout = 'center'
+    elif layout == 'split-cam':
+        cam_region = requested_cam or detect_cam_region(source, candidate.start, candidate.end - candidate.start)
+
+    rebased = clip_cues(cues, candidate.start, candidate.end)
+    captions_srt = make_srt(cues, candidate.start, candidate.end)
+    captions_file = None
+    captions_ass_rel = None
+    if captions_srt:
+        srt_target = clip_dir / 'captions.srt'
+        srt_target.write_text(captions_srt, encoding='utf-8')
+        captions_file = srt_target
+        if caption_style != 'srt':
+            ass_target = clip_dir / 'captions.ass'
+            write_ass(rebased, ass_target, caption_style, layout=layout)
+            captions_file = ass_target
+            captions_ass_rel = f'{clip_id}/captions.ass'
+
+    target = clip_dir / 'video.mp4'
+    t0 = time.monotonic()
+    try:
+        render(
+            source,
+            target,
+            candidate.start,
+            candidate.end,
+            track,
+            layout,
+            bool(captions_srt),
+            denoise,
+            captions_file=captions_file,
+            cam_region=cam_region,
+        )
+    finally:
+        (clip_dir / 'follow.txt').unlink(missing_ok=True)
+
+    render_secs = round(time.monotonic() - t0, 2)
+    size_mb = round(target.stat().st_size / (1024 * 1024), 2) if target.is_file() else 0.0
+    log_event('pipeline.render', 'clip_rendered', {
+        'batch': folder.name,
+        'clip_id': clip_id,
+        'start': round(candidate.start, 2),
+        'end': round(candidate.end, 2),
+        'layout': layout,
+        'cam_region': _serialize_cam(cam_region),
+        'caption_style': caption_style,
+        'render_seconds': render_secs,
+        'size_mb': size_mb,
+    })
+    return {
+        'id': clip_id,
+        'start': round(candidate.start, 3),
+        'end': round(candidate.end, 3),
+        'score': round(candidate.score, 3) if candidate.score is not None else None,
+        'reason': candidate.reason,
+        'layout': layout,
+        'cam_region': _serialize_cam(cam_region),
+        'caption_style': caption_style,
+        'video': f'{clip_id}/video.mp4',
+        'captions': f'{clip_id}/captions.srt' if captions_srt else None,
+        'captions_ass': captions_ass_rel,
+    }
+
+
+def process(args, *, progress_cb: ProgressFn | None = None):
     rights = provenance(args)
     source = args.source.resolve(strict=True)
+    _emit(progress_cb, 'Analizando video', 5, f'Inspeccionando {source.name}...')
     info = probe(source)
+    log_event('pipeline.process', 'source_probed', {
+        'source': str(source),
+        'duration': round(info.duration, 2),
+        'width': info.width,
+        'height': info.height,
+        'audio_tracks': info.audio_tracks,
+    })
+
     if args.audio_track is not None and not 0 <= args.audio_track < info.audio_tracks:
         raise ValueError(f'La fuente tiene {info.audio_tracks} pistas de audio. La numeración empieza en 0.')
     track = args.audio_track if args.audio_track is not None else (0 if info.audio_tracks else None)
     manual = manual_ranges(args.range, info.duration)
-    if not 1 <= args.count <= 50 or not 1 <= args.min_seconds <= args.max_seconds <= 180:
-        raise ValueError('Usa 1 a 50 clips y un intervalo de duración entre 1 y 180 segundos.')
+    if not 0 <= args.count <= 50 or not 1 <= args.min_seconds <= args.max_seconds <= 180:
+        raise ValueError('Usa 0 (automático) o de 1 a 50 clips y una duración entre 1 y 180 segundos.')
     requested_cam = parse_cam_region(args.cam_region) if args.layout == 'split-cam' else None
     cues = read_srt(args.srt) if args.srt else []
     args.output.mkdir(parents=True, exist_ok=True)
     folder = Path(tempfile.mkdtemp(prefix='lote-', dir=args.output)).resolve()
     clips = []
+    preview_first = bool(getattr(args, 'preview_first', False))
     try:
         with tempfile.TemporaryDirectory(prefix='clipforge-audio-') as directory:
             energy = []
+            muted_ranges: list[tuple[float, float]] = []
             needs_asr = not args.srt and not args.skip_asr
             if track is not None and (not manual or needs_asr):
                 wav = Path(directory) / 'voz.wav'
+                _emit(progress_cb, 'Analizando audio', 15, 'Extrayendo audio y detectando comerciales/silencios...')
                 print('Analizando audio…', flush=True)
                 energy = audio_preview(source, wav, track)
+                muted_ranges = detect_muted_ranges(energy)
+                if muted_ranges:
+                    muted_secs = round(sum(end - start for start, end in muted_ranges), 1)
+                    log_event('pipeline.process', 'muted_commercials_detected', {
+                        'batch': folder.name,
+                        'count': len(muted_ranges),
+                        'total_muted_seconds': muted_secs,
+                        'ranges': [[round(s, 1), round(e, 1)] for s, e in muted_ranges],
+                    })
                 if needs_asr:
+                    _emit(progress_cb, 'Transcribiendo', 30, f'Transcribiendo audio con Whisper ({args.model})...')
                     print(f'Transcribiendo con {args.model}…', flush=True)
+                    t_asr = time.monotonic()
                     cues = speech(wav, args.model, args.language)
-            candidates = manual or suggest(cues, energy, info.duration, args.count, args.min_seconds, args.max_seconds)
-            for index, candidate in enumerate(candidates, 1):
-                clip_id = f'clip-{index:02}'
-                clip_dir = folder / clip_id
-                clip_dir.mkdir()
-                layout = args.layout
-                cam_region = None
-                if layout == 'face':
-                    found = face_commands(source, candidate.start, candidate.end - candidate.start, clip_dir / 'follow.txt')
-                    if not found:
-                        layout = 'center'
-                elif layout == 'split-cam':
-                    cam_region = requested_cam or detect_cam_region(source, candidate.start, candidate.end - candidate.start)
+                    log_event('pipeline.process', 'transcription_done', {
+                        'batch': folder.name,
+                        'model': args.model,
+                        'language': args.language,
+                        'cues_count': len(cues),
+                        'elapsed_seconds': round(time.monotonic() - t_asr, 2),
+                    })
 
-                rebased = clip_cues(cues, candidate.start, candidate.end)
-                captions_srt = make_srt(cues, candidate.start, candidate.end)
-                captions_file = None
-                captions_ass_rel = None
-                if captions_srt:
-                    srt_target = clip_dir / 'captions.srt'
-                    srt_target.write_text(captions_srt, encoding='utf-8')
-                    captions_file = srt_target
-                    if args.caption_style != 'srt':
-                        ass_target = clip_dir / 'captions.ass'
-                        write_ass(rebased, ass_target, args.caption_style, layout=layout)
-                        captions_file = ass_target
-                        captions_ass_rel = f'{clip_id}/captions.ass'
+            _emit(progress_cb, 'Seleccionando momentos', 55, 'Calculando mejores momentos fuera de silencios/comerciales...')
+            candidates = manual or suggest(
+                cues,
+                energy,
+                info.duration,
+                args.count,
+                args.min_seconds,
+                args.max_seconds,
+                muted_ranges=muted_ranges,
+            )
+            log_event('pipeline.process', 'candidates_selected', {
+                'batch': folder.name,
+                'requested_count': args.count,
+                'selected_count': len(candidates),
+                'preview_first': preview_first,
+                'candidates': [
+                    {'start': round(c.start, 2), 'end': round(c.end, 2), 'score': round(c.score, 3) if c.score is not None else None}
+                    for c in candidates
+                ],
+            })
 
-                target = clip_dir / 'video.mp4'
-                print(f'{clip_id} · {candidate.start:.1f}s–{candidate.end:.1f}s · {layout} · {args.caption_style}', flush=True)
-                try:
-                    render(
-                        source,
-                        target,
-                        candidate.start,
-                        candidate.end,
-                        track,
-                        layout,
-                        bool(captions_srt),
-                        args.denoise,
-                        captions_file=captions_file,
-                        cam_region=cam_region,
-                    )
-                finally:
-                    (clip_dir / 'follow.txt').unlink(missing_ok=True)
-                clips.append({
-                    'id': clip_id,
-                    'start': round(candidate.start, 3),
-                    'end': round(candidate.end, 3),
-                    'score': round(candidate.score, 3) if candidate.score is not None else None,
-                    'reason': candidate.reason,
-                    'layout': layout,
-                    'cam_region': _serialize_cam(cam_region),
-                    'caption_style': args.caption_style,
-                    'video': f'{clip_id}/video.mp4',
-                    'captions': f'{clip_id}/captions.srt' if captions_srt else None,
-                    'captions_ass': captions_ass_rel,
-                })
-        save_json(folder / 'manifest.json', {'source': str(source), 'rights': rights, 'audio_track': track, 'clips': clips})
+            # Always persist plan.json so preview-first batches can finish clips 2..N without re-running Whisper
+            plan_data = {
+                'source': str(source),
+                'rights': rights,
+                'audio_track': track,
+                'duration': round(info.duration, 3),
+                'layout': args.layout,
+                'cam_region_spec': args.cam_region,
+                'caption_style': args.caption_style,
+                'denoise': bool(args.denoise),
+                'muted_ranges': [[round(s, 2), round(e, 2)] for s, e in muted_ranges],
+                'candidates': [
+                    {
+                        'index': idx,
+                        'start': round(c.start, 3),
+                        'end': round(c.end, 3),
+                        'score': round(c.score, 3) if c.score is not None else None,
+                        'reason': c.reason,
+                    }
+                    for idx, c in enumerate(candidates, 1)
+                ],
+                'cues': _serialize_cues(cues),
+            }
+            save_json(folder / 'plan.json', plan_data)
+
+            render_candidates = candidates[:1] if (preview_first and len(candidates) > 1) else candidates
+            total_to_render = len(render_candidates)
+            for idx, candidate in enumerate(render_candidates, 1):
+                pct = 60 + int((idx - 1) / max(1, total_to_render) * 35)
+                _emit(
+                    progress_cb,
+                    'Renderizando',
+                    pct,
+                    f'Renderizando clip {idx} de {total_to_render} ({candidate.start:.0f}s–{candidate.end:.0f}s)...',
+                )
+                print(f'clip-{idx:02} · {candidate.start:.1f}s–{candidate.end:.1f}s · {args.layout} · {args.caption_style}', flush=True)
+                clip_entry = _render_single_candidate(
+                    source,
+                    folder,
+                    idx,
+                    candidate,
+                    cues,
+                    track,
+                    args.layout,
+                    requested_cam,
+                    args.caption_style,
+                    bool(args.denoise),
+                )
+                clips.append(clip_entry)
+
+        awaiting = preview_first and len(candidates) > 1
+        save_json(
+            folder / 'manifest.json',
+            {
+                'source': str(source),
+                'rights': rights,
+                'audio_track': track,
+                'status': 'awaiting_preview_approval' if awaiting else 'complete',
+                'planned_total': len(candidates),
+                'remaining_count': max(0, len(candidates) - len(clips)),
+                'muted_ranges': [[round(s, 2), round(e, 2)] for s, e in muted_ranges],
+                'clips': clips,
+            },
+        )
+        _emit(
+            progress_cb,
+            'Esperando aprobación de cámara' if awaiting else 'Completado',
+            100,
+            f'Clip 1 de {len(candidates)} listo para revisar cámara' if awaiting else f'{len(clips)} clips generados',
+        )
     except Exception:
         if not clips:
             shutil.rmtree(folder, ignore_errors=True)
@@ -187,6 +379,130 @@ def process(args):
             print(f'El lote quedó incompleto en {folder}. Los lotes incompletos no se pueden aprobar.', file=sys.stderr)
         raise
     print(folder)
+    return folder
+
+
+def retest_preview_clip(
+    folder: Path,
+    *,
+    layout: str | None = None,
+    cam_region_spec: str | None = None,
+    caption_style: str | None = None,
+    denoise: bool | None = None,
+    progress_cb: ProgressFn | None = None,
+) -> dict:
+    """Re-render only clip-01 from plan.json so the user can calibrate the webcam box quickly."""
+    folder = folder.resolve(strict=True)
+    plan = json.loads((folder / 'plan.json').read_text(encoding='utf-8'))
+    manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
+    source = Path(plan['source']).resolve(strict=True)
+    cues = _deserialize_cues(plan.get('cues') or [])
+    first = plan['candidates'][0]
+    candidate = Candidate(first['start'], first['end'], first.get('score'), first.get('reason', ''))
+
+    use_layout = layout or plan.get('layout', 'split-cam')
+    use_cam_spec = cam_region_spec if cam_region_spec is not None else plan.get('cam_region_spec', 'auto')
+    requested_cam = parse_cam_region(use_cam_spec) if use_layout == 'split-cam' else None
+    use_style = caption_style or plan.get('caption_style', 'highlight')
+    use_denoise = plan.get('denoise', True) if denoise is None else bool(denoise)
+
+    _emit(progress_cb, 'Probando cámara', 35, f'Re-renderizando clip-01 ({use_layout} · {use_cam_spec})...')
+    updated_clip = _render_single_candidate(
+        source,
+        folder,
+        1,
+        candidate,
+        cues,
+        plan.get('audio_track'),
+        use_layout,
+        requested_cam,
+        use_style,
+        use_denoise,
+    )
+    plan['layout'] = use_layout
+    plan['cam_region_spec'] = use_cam_spec
+    plan['approved_cam_region'] = updated_clip['cam_region']
+    plan['caption_style'] = use_style
+    plan['denoise'] = use_denoise
+    save_json(folder / 'plan.json', plan)
+
+    manifest['clips'] = [updated_clip, *[c for c in manifest.get('clips', []) if c['id'] != 'clip-01']]
+    save_json(folder / 'manifest.json', manifest)
+    _emit(progress_cb, 'Listo para revisar', 100, 'clip-01 actualizado con el nuevo encuadre')
+    return manifest
+
+
+def continue_batch(
+    folder: Path,
+    *,
+    layout: str | None = None,
+    cam_region_spec: str | None = None,
+    caption_style: str | None = None,
+    denoise: bool | None = None,
+    progress_cb: ProgressFn | None = None,
+) -> dict:
+    """Render remaining planned clips (clip-02..N) using cached cues & approved camera region."""
+    folder = folder.resolve(strict=True)
+    plan_path = folder / 'plan.json'
+    if not plan_path.is_file():
+        raise ValueError('Este lote no tiene un plan pendiente de clips restantes.')
+    plan = json.loads(plan_path.read_text(encoding='utf-8'))
+    manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
+    source = Path(plan['source']).resolve(strict=True)
+    cues = _deserialize_cues(plan.get('cues') or [])
+    existing_ids = {clip['id'] for clip in manifest.get('clips', [])}
+
+    use_layout = layout or plan.get('layout', 'split-cam')
+    use_style = caption_style or plan.get('caption_style', 'highlight')
+    use_denoise = plan.get('denoise', True) if denoise is None else bool(denoise)
+
+    requested_cam: CamRegion | None = None
+    if use_layout == 'split-cam':
+        if cam_region_spec:
+            requested_cam = parse_cam_region(cam_region_spec)
+        elif plan.get('approved_cam_region'):
+            requested_cam = _deserialize_cam(plan['approved_cam_region'])
+        elif manifest.get('clips') and manifest['clips'][0].get('cam_region'):
+            # Reuse the exact camera box approved on clip-01 across the whole stream!
+            requested_cam = _deserialize_cam(manifest['clips'][0]['cam_region'])
+
+    pending = [c for c in plan.get('candidates', []) if f'clip-{int(c["index"]):02}' not in existing_ids]
+    total = len(pending)
+    if not pending:
+        manifest['status'] = 'complete'
+        manifest['remaining_count'] = 0
+        save_json(folder / 'manifest.json', manifest)
+        return manifest
+
+    clips = list(manifest.get('clips', []))
+    for pos, item in enumerate(pending, 1):
+        idx = int(item['index'])
+        candidate = Candidate(item['start'], item['end'], item.get('score'), item.get('reason', ''))
+        pct = int((pos - 1) / max(1, total) * 90) + 5
+        _emit(progress_cb, 'Renderizando resto', pct, f'Generando clip {idx} de {len(plan["candidates"])}...')
+        clip_entry = _render_single_candidate(
+            source,
+            folder,
+            idx,
+            candidate,
+            cues,
+            plan.get('audio_track'),
+            use_layout,
+            requested_cam,
+            use_style,
+            use_denoise,
+        )
+        clips.append(clip_entry)
+        # Save incrementally so completed clips are immediately visible
+        manifest['clips'] = sorted(clips, key=lambda c: c['id'])
+        manifest['remaining_count'] = max(0, len(plan['candidates']) - len(clips))
+        save_json(folder / 'manifest.json', manifest)
+
+    manifest['status'] = 'complete'
+    manifest['remaining_count'] = 0
+    save_json(folder / 'manifest.json', manifest)
+    _emit(progress_cb, 'Completado', 100, f'Lote completo ({len(clips)} clips listos)')
+    return manifest
 
 
 def read_run(path):
@@ -431,20 +747,22 @@ def main():
     edit = commands.add_parser('process', help='Detecta, recorta y exporta un lote de clips.')
     edit.add_argument('source', type=Path)
     edit.add_argument('--output', type=Path, default=Path('salidas'))
-    edit.add_argument('--count', type=int, default=3)
-    edit.add_argument('--min-seconds', type=int, default=25)
+    edit.add_argument('--count', type=int, default=0, help='0 = automático según duración útil; o número fijo 1..50.')
+    edit.add_argument('--min-seconds', type=int, default=20)
     edit.add_argument('--max-seconds', type=int, default=55)
     edit.add_argument('--range', action='append', default=[], help='Rango INICIO,FIN. Se puede repetir.')
-    edit.add_argument('--layout', choices=LAYOUTS, default='face',
+    edit.add_argument('--layout', choices=LAYOUTS, default='split-cam',
                       help='face, center, fit o split-cam (webcam arriba + gameplay abajo).')
     edit.add_argument('--cam-region', default='auto',
                       help='Para split-cam: auto, top-left, top-right, bottom-left, bottom-right o x,y,w,h.')
     edit.add_argument('--caption-style', choices=CAPTION_STYLES, default='highlight',
                       help='Estilo de subtítulos: highlight (ASS palabra a palabra), neon, bold o srt clásico.')
+    edit.add_argument('--preview-first', action='store_true',
+                      help='Genera solo clip-01 para validar el marco de cámara y guarda plan.json para el resto.')
     edit.add_argument('--srt', type=Path, help='Subtítulos existentes con los tiempos del video largo.')
     edit.add_argument('--skip-asr', action='store_true', help='Omite transcripción y usa SRT o energía de audio.')
-    edit.add_argument('--model', default='small', help='Modelo faster-whisper, por ejemplo small, base o una ruta local.')
-    edit.add_argument('--language', default='es', help='Idioma Whisper, por ejemplo es, en o auto.')
+    edit.add_argument('--model', default='base', help='Modelo faster-whisper, por ejemplo base, small o una ruta local.')
+    edit.add_argument('--language', default='auto', help='Idioma Whisper, por ejemplo es, en o auto.')
     edit.add_argument('--denoise', action='store_true', help='Reducción de ruido adicional con FFmpeg.')
     edit.add_argument('--audio-track', type=int, help='Índice de pista de audio de OBS u otra fuente, desde 0.')
     add_rights(edit)
