@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "channels": {
+    "es_main": {
+      "name": "Canal Principal Español",
+      "audience_language": "es",
+      "typical_source_languages": ["en", "es"],
+      "platforms": ["youtube", "tiktok"],
+      "content_focus": ["GTA 6", "gaming", "stream reactions"],
+      "tone": "Dinámico, cercano, español latinoamericano natural con jerga gamer real",
+      "subtitle_limits": {
+        "max_chars_per_line": 34,
+        "max_lines": 2,
+        "max_cps": 20.0
+      },
+      "default_layout": {
+        "gameplay": "fit",
+        "talking_head": "face"
+      }
+    },
+    "en_main": {
+      "name": "English Channel",
+      "audience_language": "en",
+      "typical_source_languages": ["es", "pt", "ja", "en"],
+      "platforms": ["youtube", "tiktok"],
+      "content_focus": ["GTA 6", "gaming", "stream reactions"],
+      "tone": "Punchy, conversational YouTube/Twitch English",
+      "subtitle_limits": {
+        "max_chars_per_line": 36,
+        "max_lines": 2,
+        "max_cps": 22.0
+      },
+      "default_layout": {
+        "gameplay": "fit",
+        "talking_head": "face"
+      }
+    }
+  }
+}

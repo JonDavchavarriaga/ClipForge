@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="clipforge-token" content="__CLIPFORGE_TOKEN__" />
+  <title>ClipForge Studio — Local</title>
+  <link rel="icon" type="image/svg+xml" href="/static/logo.svg" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <img src="/static/logo.svg" alt="ClipForge" class="brand-logo" />
+        <div>
+          <h1>ClipForge</h1>
+          <span class="subtitle">Studio Local · Live + 9:16</span>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <button class="nav-btn active" data-tab="live">📺 Ver Live y Auto-Clip</button>
+        <button class="nav-btn" data-tab="process">⚡ Generar Clips 9:16</button>
+        <button class="nav-btn" data-tab="review">🎬 Revisar y Traducir</button>
+        <button class="nav-btn" data-tab="publish">🚀 Aprobar y Publicar</button>
+        <button class="nav-btn" data-tab="library">📁 Biblioteca y Logs</button>
+      </nav>
+
+      <div class="sidebar-card">
+        <div class="card-title">Agentes locales</div>
+        <div id="agent-badges" class="badges"></div>
+      </div>
+
+      <div class="sidebar-card">
+        <div class="card-title">Actividad reciente</div>
+        <div id="job-list" class="job-list">
+          <div class="muted">Sin trabajos activos</div>
+        </div>
+      </div>
+
+      <div class="sidebar-footer">
+        <button id="shutdown-btn" class="btn btn-ghost btn-sm">Apagar servidor local</button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <div id="toast" class="toast hidden"></div>
+
+      <!-- TAB 1: WATCH LIVE + AUTO-CLIP + 1H-2H RECORDING -->
+      <section id="tab-live" class="tab-panel active">
+        <header class="panel-header">
+          <div>
+            <h2>📺 Ver Live, Grabar (1h–2h+) y Auto-Clip</h2>
+            <p class="muted">Pega un canal de Twitch, Kick o YouTube Live para verlo aquí mismo mientras se graba sin peso de CPU y saca clips automáticos cuando hay picos de reacción.</p>
+          </div>
+          <div id="live-pill" class="pill pill-idle">INACTIVO</div>
+        </header>
+
+        <div class="card live-bar-card">
+          <div class="live-url-row">
+            <input id="live-url" type="url" placeholder="https://www.twitch.tv/canal  o  https://kick.com/canal  o  https://youtube.com/watch?v=..." />
+            <select id="live-quality" style="max-width:140px;">
+              <option value="best">Máxima</option>
+              <option value="1080">1080p</option>
+              <option value="720">720p</option>
+            </select>
+            <button id="live-watch-btn" class="btn btn-ghost">👁️ Solo Ver</button>
+            <button id="live-start-btn" class="btn btn-primary">🔴 Ver y Grabar</button>
+            <button id="live-stop-btn" class="btn btn-danger" disabled>■ Detener</button>
+          </div>
+
+          <div class="live-toggles">
+            <label class="checkbox-row">
+              <input id="live-autoclip" type="checkbox" checked />
+              <span>⚡ Auto-clipear picos de reacción</span>
+            </label>
+            <select id="live-sensitivity" style="width:auto;">
+              <option value="high">Sensibilidad Alta</option>
+              <option value="medium" selected>Sensibilidad Media</option>
+              <option value="low">Sensibilidad Baja</option>
+            </select>
+            <select id="live-autoclip-seconds" style="width:auto;">
+              <option value="30">Auto-clip 30s</option>
+              <option value="45" selected>Auto-clip 45s</option>
+              <option value="60">Auto-clip 60s</option>
+            </select>
+            <label class="checkbox-row">
+              <input id="live-save-full" type="checkbox" checked />
+              <span>💾 Guardar live completo (1h–2h+)</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="live-auto-process" type="checkbox" />
+              <span>🎬 Pasar clips a 9:16 automáticamente</span>
+            </label>
+          </div>
+
+          <div id="live-error-banner" class="error-banner hidden"></div>
+        </div>
+
+        <div class="live-main-grid">
+          <div class="card player-card">
+            <div class="card-head-row">
+              <h3>Ventana del Stream en Vivo</h3>
+              <a id="live-open-ext" class="ext-link hidden" target="_blank" rel="noreferrer">Abrir en navegador ↗</a>
+            </div>
+            <div id="live-embed-wrap" class="live-embed-wrap">
+              <div class="embed-placeholder">
+                Pega una URL de Twitch, Kick o YouTube Live arriba y pulsa <strong>Ver y Grabar</strong> para ver el stream aquí mismo.
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Control y Clips al Instante</h3>
+            <div class="metrics">
+              <div class="metric">
+                <span class="metric-label">Grabado</span>
+                <strong id="live-buffered">0s</strong>
+              </div>
+              <div class="metric">
+                <span class="metric-label">Audio (dB)</span>
+                <strong id="live-db">-60</strong>
+              </div>
+              <div class="metric">
+                <span class="metric-label">Clips</span>
+                <strong id="live-clip-count">0</strong>
+              </div>
+            </div>
+
+            <div class="clip-buttons">
+              <button class="btn btn-accent live-cut-btn" data-seconds="30" disabled>⚡ Cortar 30s</button>
+              <button class="btn btn-accent live-cut-btn" data-seconds="45" disabled>⚡ Cortar 45s</button>
+              <button class="btn btn-accent live-cut-btn" data-seconds="60" disabled>⚡ Cortar 60s</button>
+              <button class="btn btn-accent live-cut-btn" data-seconds="90" disabled>⚡ Cortar 90s</button>
+            </div>
+
+            <div class="subhead">Clips de esta sesión (auto y manuales)</div>
+            <div id="live-clips-list" class="list-box">
+              <div class="muted">Los clips manuales y automáticos aparecerán aquí y en <code>workspace/live_clips/</code>.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: SIMPLE 1-CLICK PROCESS VOD -->
+      <section id="tab-process" class="tab-panel">
+        <header class="panel-header">
+          <div>
+            <h2>⚡ Generar Clips Verticales (9:16)</h2>
+            <p class="muted">Flujo rápido local: elige un clip o grabación larga, selecciona un preset y genera clips listos con subtítulos dinámicos `.ass`.</p>
+          </div>
+          <button id="refresh-sources-btn" class="btn btn-ghost">↻ Actualizar videos</button>
+        </header>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3>Generación Rápida</h3>
+
+            <div class="preset-row">
+              <button type="button" class="preset-btn active" data-preset="gta-split">🎮 Stream + Cámara (Split-Cam)</button>
+              <button type="button" class="preset-btn" data-preset="talking">🗣️ Solo Cámara / Reacción</button>
+              <button type="button" class="preset-btn" data-preset="gameplay">📺 Gameplay Completo</button>
+            </div>
+
+            <div class="field">
+              <label for="proc-source">Video a procesar (haz clic en cualquier video de la derecha o pega la ruta)</label>
+              <input id="proc-source" type="text" placeholder="D:\Code\ClipForge\workspace\live_clips\..." />
+            </div>
+
+            <div class="row-3">
+              <div class="field">
+                <label for="proc-language">Idioma del video</label>
+                <select id="proc-language">
+                  <option value="auto" selected>Automático</option>
+                  <option value="en">Inglés (en)</option>
+                  <option value="es">Español (es)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="proc-caption-style">Estilo subtítulos</label>
+                <select id="proc-caption-style">
+                  <option value="highlight" selected>highlight (Amarillo palabra a palabra)</option>
+                  <option value="neon">neon (Gaming MAYÚSCULAS cian)</option>
+                  <option value="bold">bold (Bloque limpio)</option>
+                  <option value="srt">srt (Clásico)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="proc-count">Cantidad de clips</label>
+                <input id="proc-count" type="number" min="1" max="20" value="3" />
+              </div>
+            </div>
+
+            <details class="advanced-box">
+              <summary>Opciones avanzadas (cámara, modelo Whisper, duración y rangos)</summary>
+              <div class="row-2" style="margin-top:10px;">
+                <div class="field">
+                  <label for="proc-layout">Encuadre vertical</label>
+                  <select id="proc-layout">
+                    <option value="split-cam" selected>split-cam (Webcam arriba + Gameplay abajo)</option>
+                    <option value="face">face (Seguimiento facial)</option>
+                    <option value="fit">fit (Cuadro completo)</option>
+                    <option value="center">center (Centrado)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="proc-cam-region">Posición webcam</label>
+                  <select id="proc-cam-region">
+                    <option value="auto" selected>auto (Detectar cara)</option>
+                    <option value="bottom-right">Abajo derecha</option>
+                    <option value="bottom-left">Abajo izquierda</option>
+                    <option value="top-right">Arriba derecha</option>
+                    <option value="top-left">Arriba izquierda</option>
+                  </select>
+                </div>
+              </div>
+              <div class="row-3">
+                <div class="field">
+                  <label for="proc-model">Modelo Whisper</label>
+                  <select id="proc-model">
+                    <option value="base" selected>base (rápido)</option>
+                    <option value="small">small (equilibrado)</option>
+                    <option value="medium">medium (preciso)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="proc-min">Mínimo (s)</label>
+                  <input id="proc-min" type="number" min="5" max="180" value="20" />
+                </div>
+                <div class="field">
+                  <label for="proc-max">Máximo (s)</label>
+                  <input id="proc-max" type="number" min="5" max="180" value="55" />
+                </div>
+              </div>
+              <div class="field">
+                <label for="proc-ranges">Rangos manuales opcionales (uno por línea: INICIO,FIN)</label>
+                <textarea id="proc-ranges" rows="2" placeholder="Vacío = detección automática de mejores momentos"></textarea>
+              </div>
+              <label class="checkbox-row">
+                <input id="proc-denoise" type="checkbox" checked />
+                <span>Limpiar ruido de micrófono (`--denoise`)</span>
+              </label>
+            </details>
+
+            <div class="actions">
+              <button id="proc-start-btn" class="btn btn-primary" style="width:100%;padding:12px;">⚡ Generar Clips 9:16 Ahora</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Tus Videos Disponibles (Live Clips, Lives y Fuentes)</h3>
+            <div id="sources-list" class="list-box tall">
+              <div class="muted">Aún no hay videos en tu carpeta local.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: REVIEW & BILINGUAL SUBTITLES + CLAUDE/CODEX -->
+      <section id="tab-review" class="tab-panel">
+        <header class="panel-header">
+          <div>
+            <h2>🎬 Revisar Clips, Traducir EN↔ES y Consultar Agentes</h2>
+            <p class="muted">Previsualiza el 9:16 real, edita traducciones sin mover timestamps y pide revisión a Claude Code o Codex.</p>
+          </div>
+          <button id="refresh-batches-btn" class="btn btn-ghost">↻ Actualizar lotes</button>
+        </header>
+
+        <div class="review-layout">
+          <div class="card">
+            <h3>Lotes y Clips</h3>
+            <div class="field">
+              <label for="batch-select">Lote (`workspace/rendered_clips/`)</label>
+              <select id="batch-select"></select>
+            </div>
+            <div id="clip-selector" class="list-box"></div>
+            <div class="preview-wrap">
+              <video id="clip-player" controls playsinline></video>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Subtítulos Bilingües EN ↔ ES</h3>
+            <div class="row-3">
+              <div class="field">
+                <label for="tr-src">Idioma fuente</label>
+                <select id="tr-src">
+                  <option value="en">Inglés (en)</option>
+                  <option value="es">Español (es)</option>
+                  <option value="auto">Auto</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="tr-dst">Idioma destino</label>
+                <select id="tr-dst">
+                  <option value="es">Español (es)</option>
+                  <option value="en">Inglés (en)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="tr-style">Estilo al re-renderizar</label>
+                <select id="tr-style">
+                  <option value="highlight">highlight (.ass)</option>
+                  <option value="neon">neon (.ass)</option>
+                  <option value="bold">bold (.ass)</option>
+                  <option value="srt">srt</option>
+                </select>
+              </div>
+            </div>
+            <div class="field">
+              <label for="tr-context">Contexto del clip</label>
+              <input id="tr-context" type="text" placeholder="Ej. GTA 6 persecución y reacción en stream" />
+            </div>
+            <div class="actions wrap">
+              <button id="tr-pack-btn" class="btn btn-ghost">📦 Empaquetar SRT</button>
+              <button id="tr-save-btn" class="btn btn-ghost">💾 Guardar</button>
+              <button id="tr-claude-btn" class="btn btn-accent">🤖 Revisar con Claude</button>
+              <button id="tr-codex-btn" class="btn btn-accent">🤖 Revisar con Codex</button>
+              <button id="tr-apply-btn" class="btn btn-primary">✨ Aplicar y Re-renderizar</button>
+            </div>
+
+            <div id="cues-editor" class="cues-editor">
+              <div class="muted">Selecciona un clip y pulsa "Empaquetar SRT".</div>
+            </div>
+
+            <div id="agent-report-box" class="agent-report hidden">
+              <div class="subhead">Respuesta del agente (guardada en `.agents/handoffs/`)</div>
+              <pre id="agent-report-text"></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: PUBLISH -->
+      <section id="tab-publish" class="tab-panel">
+        <header class="panel-header">
+          <div>
+            <h2>🚀 Aprobar y Exportar Cola (YouTube Shorts + TikTok)</h2>
+            <p class="muted">Aprueba tus clips finales y exporta `publicacion.csv`.</p>
+          </div>
+        </header>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3>Aprobar clip seleccionado</h3>
+            <p id="pub-selected-info" class="muted">Selecciona un lote y clip en "Revisar y Traducir".</p>
+            <div class="field">
+              <label for="pub-title">Título (máx. 100 caracteres)</label>
+              <input id="pub-title" type="text" maxlength="100" placeholder="La reacción más épica en GTA 6 #shorts" />
+            </div>
+            <div class="field">
+              <label for="pub-caption">Descripción / Caption</label>
+              <textarea id="pub-caption" rows="4" placeholder="#gta6 #gaming #shorts"></textarea>
+            </div>
+            <div class="field">
+              <label for="pub-schedule">Fecha programada opcional (ISO 8601)</label>
+              <input id="pub-schedule" type="text" placeholder="2027-01-15T18:00:00-05:00" />
+            </div>
+            <div class="platforms-row">
+              <label class="checkbox-row"><input type="checkbox" class="pub-platform" value="youtube" checked /> YouTube Shorts</label>
+              <label class="checkbox-row"><input type="checkbox" class="pub-platform" value="tiktok" checked /> TikTok</label>
+              <label class="checkbox-row"><input type="checkbox" class="pub-platform" value="instagram" /> Instagram</label>
+              <label class="checkbox-row"><input type="checkbox" class="pub-platform" value="facebook" /> Facebook</label>
+            </div>
+            <div class="actions">
+              <button id="pub-approve-btn" class="btn btn-primary">✅ Aprobar Clip</button>
+              <button id="pub-queue-btn" class="btn btn-accent">📄 Exportar publicacion.csv</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Accesos rápidos</h3>
+            <ul class="studio-links">
+              <li><a href="https://studio.youtube.com/" target="_blank" rel="noreferrer">YouTube Studio</a></li>
+              <li><a href="https://www.tiktok.com/tiktokstudio/upload" target="_blank" rel="noreferrer">TikTok Studio</a></li>
+              <li><a href="https://business.facebook.com/" target="_blank" rel="noreferrer">Meta Business Suite</a></li>
+            </ul>
+            <div id="pub-queue-result" class="hint"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 5: LOCAL WORKSPACE LIBRARY & LOGS -->
+      <section id="tab-library" class="tab-panel">
+        <header class="panel-header">
+          <div>
+            <h2>📁 Biblioteca Local y Logs de Errores</h2>
+            <p id="workspace-root-path" class="muted">Carpeta local: cargando...</p>
+          </div>
+          <div class="actions" style="margin:0;">
+            <button id="refresh-library-btn" class="btn btn-ghost">↻ Actualizar</button>
+            <button class="btn btn-primary open-folder-btn" data-folder="root">📂 Abrir workspace/</button>
+          </div>
+        </header>
+
+        <div class="folder-pills">
+          <button class="btn btn-ghost open-folder-btn" data-folder="live_recordings">🎥 Abrir live_recordings/ (1h–2h)</button>
+          <button class="btn btn-ghost open-folder-btn" data-folder="live_clips">⚡ Abrir live_clips/</button>
+          <button class="btn btn-ghost open-folder-btn" data-folder="rendered_clips">📱 Abrir rendered_clips/ (9:16)</button>
+          <button class="btn btn-ghost open-folder-btn" data-folder="logs">📋 Abrir logs/</button>
+        </div>
+
+        <div class="grid-2" style="margin-bottom:18px;">
+          <div class="card">
+            <h3>🎥 Grabaciones Completas de Lives (1h / 2h+)</h3>
+            <div id="lib-recordings" class="list-box"></div>
+          </div>
+          <div class="card">
+            <h3>⚡ Clips Sacados en Vivo (Auto / Manual)</h3>
+            <div id="lib-live-clips" class="list-box"></div>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3>🚨 Errores Guardados (<code>workspace/logs/errors.jsonl</code>)</h3>
+            <div id="errors-list" class="list-box tall"></div>
+          </div>
+          <div class="card">
+            <h3>📋 Log del Sistema (<code>workspace/logs/clipforge.log</code>)</h3>
+            <pre id="system-log-box" class="log-pre"></pre>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

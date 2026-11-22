@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+salidas/
+fuentes/
+workspace/
+.agents/handoffs/
+client_secret*.json
+*.sqlite3
