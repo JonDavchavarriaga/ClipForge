@@ -1,31 +1,29 @@
-# Hoja de Ruta — ClipForge
+# Hoja de Ruta — Gevik Clip
 
-## Fase 1 — Base limpia y arquitectura agéntica (Completada)
+## Fase 1 — Núcleo modular y arquitectura agéntica (Completada)
 
-- [x] Estructura modular `src/clipforge/` + `tests/` + `pyproject.toml` manteniendo compatibilidad con `python clipforge.py`.
-- [x] Pipeline local funcional: ingesta (`yt-dlp`), detección de momentos, `faster-whisper`, OpenCV face-tracking, render vertical 1080×1920, aprobación SHA-256, cola CSV y carga idempotente a YouTube.
-- [x] Empaquetado y validación de subtítulos bilingües EN↔ES (`translate-pack` / `translate-apply`).
-- [x] Carpeta `.agents/` compartida para Gemini Antigravity, Claude Code y Codex CLI (`agent_review.py`).
+- [x] Estructura modular `src/clipforge/` + `tests/` + `pyproject.toml` + `.agents/` compartida para Antigravity, Claude Code y Codex.
+- [x] Pipeline local: detección de reacciones, transcripción `faster-whisper`, seguimiento facial OpenCV, render 1080×1920 y carga opcional idempotente a YouTube.
 
-## Fase 2 — Automatización de clips GTA 6, Streams y Subtítulos Pro
+## Fase 2 — `split-cam`, subtítulos dinámicos `.ass` y sincronía exacta (Completada)
 
-- [x] Nuevo layout `split-cam` (webcam recortada arriba + gameplay 16:9 abajo para streams de GTA 6, con detección automática OpenCV o presets `top-left`/`top-right`/`bottom-left`/`bottom-right`/`x,y,w,h`).
-- [x] Plantillas `.ass` dinámicas con `pysubs2` (`highlight`, `neon`, `bold`) usando timestamps por palabra de `faster-whisper` e interpolación automática para subtítulos traducidos EN↔ES.
-- [x] Subcomando `rerender` para volver a quemar subtítulos traducidos (`.srt` → `.ass`) o cambiar layout en un clip puntual sin reprocesar todo el VOD.
-- [ ] Detección mejorada de hooks en inglés y español + detección de picos visuales/audio en gameplay.
-- [ ] Flujo de 1 comando para traducir y pedir doble revisión (`claude` + `codex`) sobre `translation-<lang>.json` y re-renderizar automáticamente.
+- [x] Modo `split-cam` con recorte visual de cámara sobre fotograma (estilo Recortes de Windows) y prueba rápida en el 1er clip (`preview_first`).
+- [x] Catálogo visual de 6 estilos `.ass` en tarjetas (`Amarillo Viral`, `Cian Gaming`, `Impacto Naranja`, `Gevik Plata`, `Blanco Limpio`, `Sin subtítulos`).
+- [x] Sincronización exacta (0 ms de desfase) mediante `trim`/`atrim` dentro del filtergraph y alineación por clip (ver [ADR-002](decisions/0002-zero-drift-filtergraph-subtitle-sync.md)).
+- [x] Detección y salto automático de comerciales mudos en Twitch y escalado automático de cantidad de clips en lives largos (1h–2h+).
 
-## Fase 3 — App de Escritorio Local con Logo en el Escritorio y Captura en Vivo
+## Fase 3 — App de Escritorio **Gevik Clip**, Traducción 1-Clic y Mini-Editor (Completada)
 
-- [x] Captura en vivo con buffer circular sin recodificar (`clipforge.py live` y pestaña **En Vivo** para Twitch / Kick / YouTube Live + guardado de últimos 30s/45s/60s/90s al instante).
-- [x] Interfaz local de escritorio (`clipforge.py app` en ventana nativa Edge/Chrome `--app`) para:
-  - Capturar clips en vivo o procesar VODs locales con `split-cam` y subtítulos `.ass`.
-  - Previsualizar clips 9:16, editar subtítulos EN↔ES lado a lado y disparar revisión de Claude Code / Codex con un clic.
-  - Aprobar clips con SHA-256 y exportar la cola CSV para TikTok Studio / YouTube Shorts.
-- [x] Ícono multi-resolución `assets/icons/clipforge.ico` y script `scripts/create_desktop_shortcut.ps1` para el acceso directo en el escritorio de Windows.
+- [x] Identidad visual **Gevik Clip** (negro obsidiana y plateado metálico **`G`**), `assets/icons/gevik-clip.svg`, `gevik-clip.ico` y acceso directo `Gevik Clip.lnk` en el Escritorio.
+- [x] Ventana de Live en vivo (Twitch / Kick / YouTube Live) con grabación completa 1h–2h+ y auto-clip por picos de reacción.
+- [x] Traducción automática 1-clic de subtítulos (sin modificar audio original) usando suscripciones locales **Claude Code**, **Codex** y **Gemini** (ver [ADR-003](decisions/0003-local-subscription-ai-subtitles.md)).
+- [x] Gestor profesional de clips con nombres legibles, miniaturas reales 9:16, estados (`Por revisar` / `Aprobado` / `Descartado`), vaciado de descartados y descarga directa MP4 en 1 clic.
+- [x] Mini-Editor integrado: recorte `IN`/`OUT`, altura exacta de subtítulos (`12%–90%`), tamaño de cámara split (`20%–52%`) con guías visuales en vivo, sincronía fina (`-2000..+2000 ms`) y audio.
+- [x] Gestión de espacio en **Biblioteca**: tamaño en MB/GB, marca `✓ Procesado` y borrado seguro de lives completos y clips en vivo.
+- [x] Estabilidad profesional: instancia única, `ProcessRegistry` con baja prioridad, botón **Cancelar** en la cola, descarga automática de `WhisperModel` inactivo y cierre limpio total.
 
-## Fase 4 — Mejoras opcionales bajo demanda
+## Fase 4 — Mejoras opcionales futuras (Bajo demanda)
 
-- [ ] Limpieza de voz avanzada (`DeepFilterNet` / `Demucs`) como flag opcional `--enhance-audio`.
-- [ ] Diarización (`pyannote.audio`) y multi-tracking (`Norfair` / `Supervision`) para podcasts/collabs.
-- [ ] Upscaling/interpolación puntual (`Real-ESRGAN` / `RIFE`) solo para clips destacados.
+- [ ] Limpieza avanzada de voz (`DeepFilterNet` / `Demucs`) como opción activable solo para streams con audio muy contaminado.
+- [ ] Diarización (`pyannote.audio`) para podcasts o streams con varios hablantes.
+- [ ] Detección de picos visuales en gameplay silencioso (ej. jugadas de GTA 6 sin grito en micrófono).

@@ -2,17 +2,17 @@
 
 ## Responsabilidad
 
-Preparar metadatos de alto CTR y ejecutar la cola de publicación sin errores ni duplicados.
+Preparar metadatos de alto CTR (título, hashtags y caption) y dejar los MP4 de **Gevik Clip** aprobados y listos para subir a **YouTube Shorts** y **TikTok**.
 
 ## Criterios por plataforma
 
 - **YouTube Shorts**:
   - Título ≤ 100 caracteres (ideal 45–65) con gancho claro y palabra clave del juego/tema (ej. GTA 6).
   - Descripción corta + 3–5 hashtags relevantes sin spam.
-  - Carga privada o programada con `clipforge.py youtube`, verificando siempre `--channel-id` y `--kids`.
+  - Descarga directa MP4 en 1 clic desde **Gevik Clip** para subir a YouTube Studio (o carga CLI opcional `clipforge.py youtube` en modo privado/programado).
 - **TikTok**:
   - Caption breve que invite a comentar + hashtags específicos del nicho.
-  - Exportación mediante `clipforge.py queue` (`publicacion.csv`) para subida en TikTok Studio.
+  - Descarga directa MP4 en 1 clic para subida rápida en TikTok Studio.
 
 ## Idioma de metadatos
 

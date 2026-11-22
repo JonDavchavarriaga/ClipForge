@@ -1,75 +1,88 @@
-# Arquitectura de ClipForge
+# Arquitectura de Gevik Clip
 
-ClipForge sigue un diseño **local-first**, modular y escalonado: primero un núcleo rápido y mantenible en Python + FFmpeg + `faster-whisper`, y luego extensiones opcionales solo cuando un caso real de GTA 6 o stream lo justifique.
+**Gevik Clip** sigue un diseño **local-first**, modular y liviano en Windows: núcleo en Python + FFmpeg + `faster-whisper` + OpenCV + `pysubs2`, servido en una app de escritorio local sin Docker ni infraestructura cloud, y coordinado con las suscripciones IA locales del usuario.
+
+> Consulta el razonamiento detrás de las decisiones clave en [docs/decisions/](decisions/).
+
+---
 
 ## Estructura del repositorio
 
 ```text
-ClipForge/
-├── AGENTS.md / CLAUDE.md / GEMINI.md   # Entradas compartidas para Codex, Claude Code y Antigravity
-├── .agents/                            # Reglas, roles, skills, workflows y memoria bilingüe
+ClipForge/                                    # Raíz del proyecto (paquete interno clipforge)
+├── AGENTS.md / CLAUDE.md / GEMINI.md         # Instrucciones compartidas para Antigravity, Claude Code y Codex
+├── .agents/                                  # Reglas, roles, skills, workflows y memoria bilingüe
+├── docs/
+│   ├── ARCHITECTURE.md                       # Este documento
+│   ├── ROADMAP.md                            # Estado actual y fases futuras
+│   └── decisions/                            # Architecture Decision Records (ADRs)
+│       ├── 0001-local-first-desktop-architecture.md
+│       ├── 0002-zero-drift-filtergraph-subtitle-sync.md
+│       └── 0003-local-subscription-ai-subtitles.md
+├── assets/icons/
+│   ├── gevik-clip.svg                        # Logotipo vectorial negro obsidiana y plateado ('G')
+│   └── gevik-clip.ico                        # Ícono multi-resolución Windows generado desde icon.py
+├── scripts/
+│   └── create_desktop_shortcut.ps1           # Crea Gevik Clip.lnk en el Escritorio de Windows
 ├── src/clipforge/
-│   ├── cli.py                          # CLI principal (ingesta, proceso, traducción, aprobación, YouTube)
-│   ├── config.py                       # Rutas locales y perfiles de canal (es_main / en_main)
+│   ├── cli.py                                # CLI + flujo de lotes, preview-first y calibración de cámara
+│   ├── config.py                             # Rutas locales y perfiles de canal (es_main / en_main)
+│   ├── storage.py                            # Estructura de workspace/ (recordings, clips, rendered, logs)
+│   ├── logging_utils.py                      # Logs rotativos en disco + guardas pythonw (stdout/stderr None)
+│   ├── process_manager.py                    # ProcessRegistry, prioridad baja en Windows y lock de instancia única
 │   ├── pipeline/
-│   │   ├── highlights.py               # Detección de momentos, rangos y SRT
-│   │   ├── media.py                    # FFmpeg, OpenCV face-tracking, faster-whisper y render 9:16
-│   │   └── translation.py              # Paquetes JSON EN↔ES, QA de subtítulos y exportación SRT
+│   │   ├── highlights.py                     # Detección de reacciones, auto-conteo, comerciales mudos y SRT
+│   │   ├── media.py                          # FFmpeg (filtergraph trim/atrim 0ms), OpenCV, Whisper cacheado, thumbs
+│   │   ├── subtitles.py                      # Catálogo visual de estilos .ass (pysubs2), altura Y% y offset ms
+│   │   ├── live.py                           # Buffer circular en vivo, grabación 1h–2h+ y auto-clip por picos
+│   │   ├── translation.py                    # Empaquetado JSON EN↔ES y validación estricta de timestamps
+│   │   ├── auto_translate.py                 # Traducción 1-clic con Claude Code, Codex y Gemini (solo subtítulos)
+│   │   └── editor.py                         # Mini-Editor local (Trim IN/OUT, cámara split%, altura Y%, audio)
 │   ├── publishing/
-│   │   └── publication.py              # SHA-256, cola CSV segura, ledger SQLite y YouTube Data API
+│   │   └── publication.py                    # Huella SHA-256, aprobación, SQLite idempotente y YouTube OAuth
 │   └── desktop/
-│       └── launcher.py                 # Base para la futura app de escritorio local con acceso directo
-├── tests/                              # Pruebas unitarias offline + prueba de render FFmpeg
-├── assets/icons/clipforge.svg          # Logo vectorial base del proyecto
-├── scripts/create_desktop_shortcut.ps1 # Script para crear el acceso directo en el escritorio de Windows
-├── docs/                               # Arquitectura y roadmap
-└── clipforge.py                        # Wrapper de compatibilidad en raíz
+│       ├── icon.py                           # Generador del ícono negro/plateado 'G' (.ico)
+│       ├── jobs.py                           # Cola FIFO con progreso, cancelación y descarga de Whisper inactivo
+│       ├── server.py                         # Backend HTTP localhost con token, cabeceras de seguridad y streaming Range
+│       ├── launcher.py                       # Instancia única, ventana nativa Edge/Chrome --app y cierre limpio
+│       └── static/                           # Frontend negro obsidiana / plateado (index.html, styles.css, app.js)
+├── tests/                                    # Suite unitaria e integración (unittest discover)
+└── clipforge.py                              # Punto de entrada CLI / Desktop
 ```
 
-## Mapa de las 22 herramientas open-source (por niveles)
+---
 
-En lugar de instalar las 22 herramientas a la vez (lo que rompería el entorno en Windows y multiplicaría el tiempo de render), se organizan en 3 niveles:
+## Mapa de herramientas open-source (por niveles)
 
-### Nivel 1 — Núcleo activo (MVP funcionando hoy)
+Para mantener un entorno rápido y estable en Windows, las herramientas se adoptan de forma escalonada:
 
-| # | Herramienta | Rol en ClipForge |
-|---|---|---|
-| 01 | **yt-dlp** | Descarga de fuentes autorizadas con procedencia (`download`) |
-| 03 | **OpenCV** | Seguimiento facial suavizado (`--layout face`) |
-| 04 | **OBS Studio** | Captura local de gameplay (GTA 6) y cámara multipista |
-| 07 | **Whisper (`faster-whisper`)** | Transcripción local con timestamps por palabra |
-| 16 | **libass (vía FFmpeg)** | Quemado de subtítulos en video vertical 1080×1920 |
+### Nivel 1 — Núcleo activo hoy en Gevik Clip
 
-### Nivel 2 — Siguiente salto de automatización (Fase 2)
+| Herramienta | Rol en Gevik Clip |
+|---|---|
+| **yt-dlp** | Captura de streams en vivo (Twitch/Kick/YouTube) y descargas opcionales |
+| **FFmpeg + libass** | Recorte sin deriva (`trim`/`atrim`), composición `split-cam`, audio, miniaturas y quemado `.ass` |
+| **faster-whisper** | Transcripción local en CPU (vía PCM `numpy.float32`, sin `PyAV`, con descarga en inactividad) |
+| **OpenCV** | Detección facial para `face` / `split-cam` automático y generación del ícono `.ico` |
+| **pysubs2** | Generación de plantillas `.ass` dinámicas palabra a palabra con catálogo visual |
+| **OBS Studio** | Captura local opcional de gameplay (GTA 6) y micrófono multipista |
 
-| # | Herramienta | Cuándo activarla |
-|---|---|---|
-| 09 | **stable-ts** | Cuando quieras sincronía palabra por palabra estilo karaoke sin derivas |
-| 15 | **pysubs2** | Cuando pases de SRT plano a plantillas `.ass` animadas (palabras resaltadas por color) |
-| 13 | **DeepFilterNet** | Si `afftdn` de FFmpeg no basta para limpiar micrófono con ruido de teclado/ventilador |
-| 14 | **Demucs** | Si grabas juego + voz en una sola pista y necesitas aislar tu voz para transcribir/subtitular |
-| 08 | **whisper.cpp** | Alternativa ligera sin dependencias Python pesadas (útil si empaquetas binario autónomo) |
-| 05 | **AI Shorts Generator** | Referencia de heurísticas para scoring de momentos con LLM local/externo |
+### Nivel 2 — Extensiones opcionales bajo demanda (solo si un caso real lo exige)
 
-### Nivel 3 — Especializado / Bajo demanda (Fase 3+)
+| Herramienta | Cuándo activarla |
+|---|---|
+| **DeepFilterNet** | Si `afftdn` de FFmpeg no basta para ruido extremo de teclado/ventilador |
+| **Demucs** | Si grabas juego + voz en una sola pista muy mezclada y necesitas aislar voz |
+| **pyannote.audio** | Podcasts o streams con múltiples hablantes que requieran diarización |
+| **Norfair / Supervision** | Seguimiento multi-persona avanzado cuando varios sujetos se cruzan |
+| **Real-ESRGAN / RIFE** | Escalado o interpolación puntual en clips concretos de baja calidad |
 
-| # | Herramienta | Cuándo activarla |
-|---|---|---|
-| 10 | **pyannote.audio** | Podcasts o streams con varios hablantes donde necesites diarización (quién habla cuándo) |
-| 11 | **Supervision** | Overlays de detección o análisis visual en gameplay |
-| 12 | **Norfair** | Tracking robusto multi-persona cuando dos sujetos se cruzan en cámara |
-| 02 | **OpenCut** | Edición manual rápida en línea de tiempo web cuando un clip merezca retoque fino |
-| 18 | **Kdenlive** | Edición manual avanzada con keyframes en escritorio |
-| 19 | **Shotcut** | Mezcla manual alternativa de pistas y filtros |
-| 17 | **Editly** | Ensamblado declarativo en Node para plantillas complejas (intros/outros) |
-| 06 | **Mediabunny** | Exportación/conversión dentro del navegador si la UI local migra a editor web |
-| 22 | **PyAV** | Decodificación frame-a-frame de alto rendimiento en Python si OpenCV/FFmpeg quedan cortos |
-| 20 | **Real-ESRGAN** | Escalado puntual solo para clips de baja resolución (alto costo de GPU/CPU) |
-| 21 | **RIFE** | Interpolación a 60 fps solo para jugadas específicas donde valga el tiempo de render |
+---
 
-## Arquitectura Multi-Agente Local
+## Arquitectura Multi-Agente Local (`.agents/`)
 
-- **Gemini Antigravity**: director y desarrollador principal sobre el repo.
-- **Claude Code (`claude -p`)**: localización EN↔ES natural, revisión de tono/jerga gamer y hooks.
-- **OpenAI Codex (`codex exec -`)**: auditoría de código, validación de edge cases y segunda opinión de subtítulos.
-- **Contrato común**: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` y `.agents/`.
+- **Gemini Antigravity**: dirección de arquitectura, implementación y pruebas en el workspace.
+- **Claude Code (`claude.exe -p --output-format text`)**: traducción natural EN↔ES de subtítulos y revisión editorial/código.
+- **OpenAI Codex (`codex.cmd exec --skip-git-repo-check --ephemeral -s read-only -`)**: traducción natural EN↔ES de subtítulos y auditoría técnica.
+- **Gemini CLI (`gemini`, opcional)**: tercer motor seleccionable en 1 clic al iniciar sesión con cuenta de Google.
+- **Contrato común**: [AGENTS.md](../AGENTS.md), [CLAUDE.md](../CLAUDE.md), [GEMINI.md](../GEMINI.md) y [.agents/README.md](../.agents/README.md).

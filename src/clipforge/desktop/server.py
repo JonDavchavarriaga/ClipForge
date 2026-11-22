@@ -509,8 +509,6 @@ def make_handler(state: ClipForgeAppState):
                     return
                 if path == '/static/logo.svg':
                     svg = state.root_dir / 'assets' / 'icons' / 'gevik-clip.svg'
-                    if not svg.is_file():
-                        svg = state.root_dir / 'assets' / 'icons' / 'clipforge.svg'
                     if svg.is_file():
                         self._send_bytes(svg.read_bytes(), 'image/svg+xml')
                         return

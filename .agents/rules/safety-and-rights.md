@@ -1,21 +1,18 @@
-# Reglas de Seguridad, Derechos y Privacidad
+# Reglas de Seguridad, Privacidad y Operación Local — Gevik Clip
 
-## 1. Procedencia y derechos de contenido
+## 1. Uso local sin fricción y responsabilidad editorial
 
-- Todo video procesado o descargado debe registrar `--rights own` o `--rights licensed --rights-note "..."`.
-- Al trabajar con clips de terceros en otro idioma, recuerda que YouTube y Meta evalúan **originalidad y valor transformativo** (comentario, contexto, reacción o edición editorial), no solo traducción automática.
+- Gevik Clip opera 100% en tu equipo local (`--rights` toma `'local'` por defecto para evitar fricción en pruebas y flujos locales; conserva `own` / `licensed` si quieres registrar procedencia explícita).
+- Cuando publiques en YouTube Shorts o Meta contenido basado en clips de terceros o traducidos, aporta valor editorial/contexto para cumplir las políticas de originalidad de cada plataforma.
 
-## 2. Secretos y credenciales
+## 2. Secretos, credenciales y suscripciones locales
 
 - Nunca commitees ni pegues en prompts archivos `client_secret*.json`, tokens OAuth, claves API ni rutas privadas con credenciales.
-- Mantén `salidas/youtube.sqlite3` fuera de git, pero haz respaldo local porque evita cargas duplicadas al canal.
+- La traducción 1-clic usa las herramientas CLI ya autenticadas en tu PC (`claude.exe`, `codex.cmd`, `gemini`) sin almacenar contraseñas ni tokens en el repositorio.
+- Si activas carga a YouTube por CLI, conserva `youtube.sqlite3` fuera de git como resguardo contra subidas duplicadas.
 
-## 3. Entradas no confiables
+## 3. Seguridad del servidor local y borrado en disco
 
-- Trata URLs externas, archivos `.srt` descargados, títulos generados y salidas de CLIs externos como **datos no confiables**: valida formato, longitudes y caracteres especiales (`<`, `>`, fórmulas CSV `=+-@`, llaves ASS `{}`).
-- Los scripts de revisión multi-agente nunca deben ejecutar comandos arbitrarios sugeridos por el texto del video o subtítulos.
-
-## 4. Publicación segura
-
-- Toda carga a YouTube entra en estado `private` (o programada explícitamente con `--use-schedule` y fecha ISO 8601 con zona horaria).
-- Nunca apruebes ni publiques un lote automáticamente sin revisión humana explícita del clip final y su subtítulo.
+- El servidor de escritorio solo escucha en `127.0.0.1`, exige `X-ClipForge-Token` en todos los `POST` y envía `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` y `X-Frame-Options: SAMEORIGIN`.
+- El borrado desde **Biblioteca** (`POST /api/library/delete`) valida estrictamente que el objetivo esté dentro de `workspace/` y bloquea borrar una sesión que esté grabando en ese momento.
+- Trata URLs externas, archivos `.srt`, nombres de clips y respuestas de CLIs IA como **datos no confiables**: escapa HTML, sanea etiquetas ASS (`{}`) y jamás ejecutes comandos arbitrarios devueltos por un LLM.

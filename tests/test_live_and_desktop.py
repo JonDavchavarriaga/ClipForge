@@ -150,7 +150,7 @@ class StorageAndLoggingTests(unittest.TestCase):
 class DesktopIconAndServerTests(unittest.TestCase):
     def test_generate_valid_ico(self):
         with tempfile.TemporaryDirectory() as directory:
-            ico = generate_ico(Path(directory) / 'clipforge.ico', sizes=(16, 32, 64))
+            ico = generate_ico(Path(directory) / 'gevik-clip.ico', sizes=(16, 32, 64))
             raw = ico.read_bytes()
             self.assertEqual(raw[:6], b'\x00\x00\x01\x00\x03\x00')
             self.assertGreater(len(raw), 500)

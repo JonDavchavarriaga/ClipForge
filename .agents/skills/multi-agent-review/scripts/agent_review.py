@@ -42,7 +42,7 @@ def load_role_prompt(role_name: str) -> str:
 
 def build_prompt(role_name: str, task: str, input_path: Path, include_glossary: bool = False) -> str:
     sections = [
-        '# Contexto del Proyecto ClipForge',
+        '# Contexto del Proyecto Gevik Clip',
         load_role_prompt(role_name),
     ]
     translation_rules = RULES_DIR / 'translation-style.md'
