@@ -10,7 +10,7 @@ MPEG-TS segmentation for near-zero CPU overhead. Supports:
 
 from array import array
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
 from pathlib import Path
@@ -226,6 +226,20 @@ def concat_segments_to_mp4(segments: list[Path], destination: Path) -> Path:
     return destination
 
 
+def auto_clip_post_roll(window_seconds: int) -> int:
+    """Seconds to keep recording AFTER a reaction spike so the payoff is never cut off.
+
+    The rest of the window is pre-roll (context before the spike). For a 75s window: ~26s after,
+    ~49s before.
+    """
+    return int(max(20, min(35, round(window_seconds * 0.35))))
+
+
+def auto_clip_cooldown(window_seconds: int) -> int:
+    """Minimum gap between two auto clips so consecutive clips don't mostly overlap."""
+    return int(max(55, round(window_seconds * 0.8)))
+
+
 @dataclass
 class LiveClipRecord:
     clip_id: str
@@ -236,6 +250,21 @@ class LiveClipRecord:
     url: str
     mode: str = 'manual'
     reason: str = 'Clip manual'
+    # Quick summary filled in the background (see pipeline/live_summary.py)
+    analysis: str = 'off'  # off | pending | running | done | error
+    title: str = ''
+    summary: str = ''
+    transcript: str = ''
+    language: str = ''
+    score: int | None = None
+    verdict: str = ''
+    strengths: list = field(default_factory=list)
+    weaknesses: list = field(default_factory=list)
+    summary_source: str = ''
+    analysis_warning: str = ''
+    # Automatic 9:16 render + upload pipeline status (see desktop/server.py::_on_live_summary)
+    auto_status: str = ''
+    auto_job: str = ''
 
 
 class LiveRecorder:
@@ -268,9 +297,9 @@ class LiveRecorder:
         self._channel: str = ''
         self._embed_url: str = ''
         self._rights: dict = {'kind': 'local', 'note': ''}
-        self._save_full_recording: bool = True
+        self._save_full_recording: bool = False
         self._auto_clip: bool = False
-        self._auto_clip_seconds: int = 45
+        self._auto_clip_seconds: int = 75
         self._auto_sensitivity: str = 'medium'
         self._auto_cooldown_seconds: int = 55
         self._on_auto_clip: Callable[[LiveClipRecord], None] | None = None
@@ -292,9 +321,9 @@ class LiveRecorder:
         rights_note: str = '',
         quality: str = 'best',
         *,
-        save_full_recording: bool = True,
+        save_full_recording: bool = False,
         auto_clip: bool = False,
-        auto_clip_seconds: int = 45,
+        auto_clip_seconds: int = 75,
         auto_sensitivity: str = 'medium',
         on_auto_clip: Callable[[LiveClipRecord], None] | None = None,
     ) -> dict:
@@ -360,6 +389,7 @@ class LiveRecorder:
             self._save_full_recording = bool(save_full_recording)
             self._auto_clip = bool(auto_clip)
             self._auto_clip_seconds = max(15, min(120, int(auto_clip_seconds)))
+            self._auto_cooldown_seconds = auto_clip_cooldown(self._auto_clip_seconds)
             self._auto_sensitivity = auto_sensitivity if auto_sensitivity in SENSITIVITY_DB else 'medium'
             self._on_auto_clip = on_auto_clip
             self._clips = []
@@ -391,6 +421,7 @@ class LiveRecorder:
             self._auto_clip = bool(enabled)
             if seconds is not None:
                 self._auto_clip_seconds = max(15, min(120, int(seconds)))
+                self._auto_cooldown_seconds = auto_clip_cooldown(self._auto_clip_seconds)
             if sensitivity in SENSITIVITY_DB:
                 self._auto_sensitivity = sensitivity
             return self.status()
@@ -422,7 +453,6 @@ class LiveRecorder:
         last_auto_clip_at = 0.0
         consecutive_muted = 0
         post_ad_warmup = 0
-        tail_wait = max(self.segment_seconds * 2, 10)
 
         while not self._stop_event.wait(timeout=max(2, self.segment_seconds // 2)):
             with self._lock:
@@ -495,6 +525,9 @@ class LiveRecorder:
                 else:
                     baseline.append(db)
 
+            # Wait for the reaction to play out (post-roll) before cutting, so the clip keeps context
+            # before the spike AND the payoff after it.
+            tail_wait = max(self.segment_seconds * 2, auto_clip_post_roll(auto_secs))
             if auto_on and pending_spike_at is not None and (time.monotonic() - pending_spike_at) >= tail_wait:
                 pending_spike_at = None
                 last_auto_clip_at = time.monotonic()
@@ -571,6 +604,17 @@ class LiveRecorder:
             )
             self._clips.append(record)
             return record
+
+    def update_clip(self, clip_id: str, fields: dict) -> bool:
+        """Attach background analysis results (title, summary, score...) to a session clip."""
+        with self._lock:
+            record = next((item for item in self._clips if item.clip_id == clip_id), None)
+            if record is None:
+                return False
+            for key, value in fields.items():
+                if hasattr(record, key):
+                    setattr(record, key, value)
+            return True
 
     def stop(self, *, keep_buffer: bool = False) -> dict:
         with self._lock:

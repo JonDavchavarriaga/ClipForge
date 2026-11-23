@@ -26,6 +26,68 @@ class Candidate:
     reason: str
 
 
+_SENTENCE_END = re.compile(r'[.!?…]["»”)]*$')
+_SOFT_BREAK = re.compile(r'[,;:]["»”)]*$')
+
+
+def group_words_into_cues(
+    words: list[WordTiming],
+    *,
+    max_words: int = 5,
+    max_chars: int = 30,
+    max_seconds: float = 2.8,
+    pause_seconds: float = 0.7,
+) -> list[Cue]:
+    """Group word timings into short, readable cues that respect sentence punctuation and pauses.
+
+    Rules (Shorts/TikTok readability):
+    - Close a cue after sentence punctuation (. ! ? …) and after commas once it has ≥3 words.
+    - Never let a cue exceed `max_words`, `max_chars` or `max_seconds`.
+    - A silence longer than `pause_seconds` always starts a new cue.
+    - A trailing 1-word fragment that would flash on screen (<0.6s) is merged into the previous cue.
+    """
+    clean = [WordTiming(w.start, max(w.end, w.start + 0.02), w.text.strip()) for w in words if w.text.strip()]
+    groups: list[list[WordTiming]] = []
+    current: list[WordTiming] = []
+
+    def flush():
+        if current:
+            groups.append(list(current))
+            current.clear()
+
+    for word in clean:
+        if current:
+            chars = len(' '.join(w.text for w in current)) + 1 + len(word.text)
+            if (
+                len(current) >= max_words
+                or chars > max_chars
+                or word.end - current[0].start > max_seconds
+                or word.start - current[-1].end > pause_seconds
+            ):
+                flush()
+        current.append(word)
+        if _SENTENCE_END.search(word.text) or (_SOFT_BREAK.search(word.text) and len(current) >= 3):
+            flush()
+    flush()
+
+    merged: list[list[WordTiming]] = []
+    for group in groups:
+        if merged and len(group) == 1:
+            prev = merged[-1]
+            short = group[0].end - group[0].start < 0.6
+            close = group[0].start - prev[-1].end < 0.4
+            fits = len(' '.join(w.text for w in prev)) + 1 + len(group[0].text) <= max_chars + 8
+            if short and close and fits and not _SENTENCE_END.search(prev[-1].text):
+                prev.extend(group)
+                continue
+        merged.append(group)
+
+    return [
+        Cue(group[0].start, group[-1].end, ' '.join(w.text for w in group), tuple(group))
+        for group in merged
+    ]
+
+
 def seconds(value):
     parts = value.replace(',', '.').strip().split(':')
     if not 1 <= len(parts) <= 3 or any(not re.fullmatch(r'\d+(?:\.\d+)?', part) for part in parts):
@@ -145,6 +207,47 @@ def auto_clip_count(
     return max(2, min(18, estimated, max_possible))
 
 
+def ends_sentence(text: str) -> bool:
+    return bool(_SENTENCE_END.search(text.strip()))
+
+
+def snap_clip_bounds(start: float, end: float, cues: list[Cue], duration: float, minimum: float, maximum: float,
+                     *, reach: float = 6.0) -> tuple[float, float]:
+    """Move clip edges so a good clip never starts or ends in the middle of a phrase.
+
+    - End: prefer the end of a sentence (. ! ? …) within `reach` seconds, else a natural pause,
+      while keeping the clip length within [minimum, maximum]. A short tail is kept after the last word.
+    - Never cut inside a caption: an edge that falls inside a cue moves to that cue's boundary.
+    """
+    if not cues:
+        return start, end
+
+    def pick(options):
+        valid = [e for e in options if minimum <= e - start <= maximum and abs(e - end) <= reach]
+        return min(valid, key=lambda e: (abs(e - end), -e)) if valid else None
+
+    sentence_ends = [c.end for c in cues if ends_sentence(c.text)]
+    pause_ends = [c.end for i, c in enumerate(cues) if i + 1 == len(cues) or cues[i + 1].start - c.end >= 0.6]
+    new_end = pick(sentence_ends)
+    if new_end is None:
+        new_end = pick(pause_ends)
+    if new_end is not None:
+        end = min(duration, new_end + 0.35)
+
+    for cue in cues:
+        if cue.start < end - 0.05 < cue.end:
+            if cue.end - start <= maximum:
+                end = min(duration, cue.end + 0.35)
+            elif cue.start - start >= minimum:
+                end = max(start + 0.5, cue.start - 0.05)
+            break
+    for cue in cues:
+        if cue.start < start < cue.end - 0.05:
+            start = max(0.0, cue.start - 0.25)
+            break
+    return start, end
+
+
 def suggest(cues, energy, duration, count, minimum, maximum, *, muted_ranges=None):
     cues = [cue for cue in cues if 0 <= cue.start < duration and cue.end > cue.start]
     cues.sort(key=lambda cue: cue.start)
@@ -159,6 +262,9 @@ def suggest(cues, energy, duration, count, minimum, maximum, *, muted_ranges=Non
     if duration < minimum:
         return [Candidate(0, duration, None, 'La fuente dura menos que el mínimo configurado')]
     lengths = list(dict.fromkeys((minimum, (minimum + maximum) / 2, maximum)))
+    if duration <= maximum + 1:
+        # Short source (e.g. a live auto-clip): the whole clip is a candidate, so a good moment isn't chopped.
+        lengths.append(duration)
     cue_starts = [cue.start for cue in cues]
     cue_ends = sorted(min(duration, cue.end) for cue in cues)
     cum_energy = [0.0]
@@ -189,10 +295,14 @@ def suggest(cues, energy, duration, count, minimum, maximum, *, muted_ranges=Non
                 if valid:
                     end = min(valid, key=lambda edge: abs(edge - end))
 
+            start_snapped, end = snap_clip_bounds(start, end, cues, duration, minimum, maximum)
+
             # Skip clips that fall inside Twitch commercial / muted sections (>15% muted)
             if muted_ranges and muted_overlap_ratio(start, end, muted_ranges) > 0.15:
                 continue
 
+            start_for_score = start
+            start = start_snapped
             left = bisect.bisect_left(cue_starts, start)
             right = bisect.bisect_left(cue_starts, end)
             items = cues[left:right]
@@ -212,9 +322,14 @@ def suggest(cues, energy, duration, count, minimum, maximum, *, muted_ranges=Non
                         re.I,
                     ):
                         hook += 0.13
-            score = 0.50 * activity + 0.25 * volume + hook if cues else volume
-            reason = 'Densidad de voz, energía y apertura' if cues else 'Energía de audio'
+            # Longer clips keep the context and the payoff: reward length and a clean sentence ending.
+            span = max(1.0, maximum - minimum)
+            length_bonus = 0.15 * max(0.0, min(1.0, (length - minimum) / span))
+            clean_end = 0.06 if items and ends_sentence(items[-1].text) and end - items[-1].end <= 1.0 else 0.0
+            score = (0.50 * activity + 0.25 * volume + hook + length_bonus + clean_end) if cues else volume + length_bonus
+            reason = 'Voz, energía, apertura, final de frase y duración' if cues else 'Energía de audio'
             candidates.append(Candidate(start, end, score, reason))
+            start = start_for_score
 
     if not candidates:
         raise ValueError('No se encontraron momentos activos fuera de pausas mudas/comerciales. Usa --range INICIO,FIN.')

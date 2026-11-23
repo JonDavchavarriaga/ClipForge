@@ -26,7 +26,8 @@ from clipforge.pipeline.media import (
     probe,
     render,
 )
-from clipforge.pipeline.subtitles import CAPTION_STYLES, SUBTITLE_POSITIONS, write_ass
+from clipforge.pipeline.clip_insights import apply_local_insights
+from clipforge.pipeline.subtitles import CAPTION_STYLES, SUBTITLE_POSITIONS, write_ass, write_title_ass
 from clipforge.publishing.publication import save_json
 
 ProgressFn = Callable[[str, int, str], None]
@@ -77,6 +78,8 @@ def edit_clip(
     denoise: bool | None = None,
     volume_db: float | None = None,
     srt_path: Path | None = None,
+    burn_title: bool | None = None,
+    title: str | None = None,
     progress_cb: ProgressFn | None = None,
     cancel_event: threading.Event | None = None,
 ) -> dict:
@@ -146,8 +149,8 @@ def edit_clip(
     elif clip.get('captions') and (folder / clip['captions']).is_file():
         active_srt = (folder / clip['captions']).resolve()
 
+    cues_for_clip: list[Cue] = []
     if use_style != 'none':
-        cues_for_clip: list[Cue] = []
         if active_srt and active_srt.is_file():
             existing_cues = read_srt(active_srt)
             if trim_changed and not srt_path:
@@ -179,6 +182,14 @@ def edit_clip(
                 captions_file = out_ass
                 clip['captions_ass'] = f'{clip_id}/{out_ass.name}'
 
+    if title is not None and title.strip() and title.strip() != clip.get('display_title'):
+        clip['display_title'] = title.strip()[:80]
+        clip['title_source'] = 'user'
+    use_burn_title = bool(clip.get('burn_title', True) if burn_title is None else burn_title)
+    title_text = clip.get('display_title') or ''
+    title_file = write_title_ass(title_text, clip_dir / 'title.ass', clip_duration=new_end - new_start) if (
+        use_burn_title and title_text) else None
+
     if progress_cb:
         progress_cb('Renderizando edición', 55, f'Renderizando {clip_id} ({use_layout} · {use_style})...')
 
@@ -198,6 +209,7 @@ def edit_clip(
             cam_region=cam_region,
             cam_split_pct=use_split_pct,
             volume_db=use_vol,
+            title_file=title_file,
             cancel_event=cancel_event,
         )
     finally:
@@ -217,8 +229,17 @@ def edit_clip(
     clip['subtitle_offset_ms'] = use_offset
     clip['denoise'] = use_denoise
     clip['volume_db'] = use_vol
+    clip['burn_title'] = use_burn_title
+    clip['title_burned'] = title_text if title_file else ''
     if thumb:
         clip['thumb'] = f'{clip_id}/thumb.jpg'
+    if trim_changed or 'quality' not in clip:
+        if not cues_for_clip and trim_changed:
+            plan_cues = _load_plan_cues(folder)
+            cues_for_clip = clip_cues(plan_cues, new_start, new_end) if plan_cues else []
+        elif not cues_for_clip and active_srt and active_srt.is_file():
+            cues_for_clip = read_srt(active_srt)
+        apply_local_insights(clip, cues_for_clip)
     save_json(manifest_path, manifest)
 
     log_event('pipeline.editor', 'clip_edited', {

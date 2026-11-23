@@ -100,19 +100,49 @@
               <option value="medium" selected>Sensibilidad Media</option>
               <option value="low">Sensibilidad Baja</option>
             </select>
-            <select id="live-autoclip-seconds" style="width:auto;">
-              <option value="30">30s</option>
-              <option value="45" selected>45s</option>
-              <option value="60">60s</option>
+            <select id="live-autoclip-seconds" style="width:auto;" title="Duración de cada clip automático: guarda contexto antes del pico y la reacción completa después">
+              <option value="45">Clips de 45s</option>
+              <option value="60">Clips de 60s</option>
+              <option value="75" selected>Clips de 75s</option>
+              <option value="90">Clips de 90s</option>
             </select>
-            <label class="checkbox-row">
-              <input id="live-save-full" type="checkbox" checked />
-              <span>💾 Guardar live completo (1h–2h+)</span>
+            <select id="live-language" style="width:auto;" title="Idioma en que habla el streamer (no el juego)">
+              <option value="es" selected>🗣️ Streamer en Español</option>
+              <option value="en">🗣️ Streamer en Inglés</option>
+              <option value="auto">🗣️ Idioma automático</option>
+            </select>
+            <label class="checkbox-row" title="Quita de los subtítulos y resúmenes los diálogos del juego en el otro idioma">
+              <input id="live-voice-filter" type="checkbox" checked />
+              <span>🎮 Ignorar voces del juego en otro idioma</span>
             </label>
-            <label class="checkbox-row">
-              <input id="live-auto-process" type="checkbox" />
-              <span>🎬 Convertir clips a 9:16 automáticamente</span>
+            <select id="live-summary-engine" style="width:auto;" title="Cómo generar el título y resumen de cada clip de la sesión">
+              <option value="">📝 Resumen local</option>
+              <option value="claude">📝 Resumen con Claude Code</option>
+              <option value="codex">📝 Resumen con Codex</option>
+              <option value="gemini">📝 Resumen con Gemini</option>
+            </select>
+            <label class="checkbox-row" title="Ocupa varios GB. Desactivado: solo se guardan los últimos 15 min y lo más viejo se borra solo">
+              <input id="live-save-full" type="checkbox" />
+              <span>💾 Guardar live completo (ocupa GB)</span>
             </label>
+            <select id="live-auto-render" style="width:auto;" title="Qué clips se convierten a 9:16 automáticamente">
+              <option value="score" selected>🎬 Renderizar 9:16 solo los buenos</option>
+              <option value="all">🎬 Renderizar 9:16 todos</option>
+              <option value="off">🎬 No renderizar</option>
+            </select>
+            <label class="checkbox-row" title="Puntaje mínimo (0-100) para renderizar y subir">
+              <span>Mín.</span>
+              <input id="live-min-score" type="number" min="0" max="100" value="70" style="width:64px;" />
+            </label>
+            <label class="checkbox-row" title="Sube en PRIVADO a YouTube los clips renderizados con puntaje alto">
+              <input id="live-pub-youtube" type="checkbox" class="live-pub" value="youtube" />
+              <span>🚀 Subir a YouTube (privado)</span>
+            </label>
+            <label class="checkbox-row" title="Envía como BORRADOR a tu bandeja de TikTok los clips con puntaje alto">
+              <input id="live-pub-tiktok" type="checkbox" class="live-pub" value="tiktok" />
+              <span>🚀 Subir a TikTok (borrador)</span>
+            </label>
+            <span class="muted" style="font-size:11.5px;">Sin "live completo" solo se guardan los últimos 15 min y lo viejo se borra solo.</span>
           </div>
         </div>
 
@@ -194,10 +224,14 @@
               <div class="field">
                 <label for="proc-language">Idioma hablado en el video</label>
                 <select id="proc-language">
-                  <option value="auto" selected>Automático</option>
+                  <option value="es" selected>Español (es)</option>
                   <option value="en">Inglés (en)</option>
-                  <option value="es">Español (es)</option>
+                  <option value="auto">Automático</option>
                 </select>
+                <label class="checkbox-row" style="margin-top:6px;" title="Solo subtitula la voz del streamer en el idioma elegido; quita diálogos del juego en el otro idioma">
+                  <input id="proc-voice-filter" type="checkbox" checked />
+                  <span>🎮 Ignorar voces del juego en otro idioma</span>
+                </label>
               </div>
               <div class="field">
                 <label for="proc-count">Cantidad de clips</label>
@@ -215,6 +249,17 @@
               <input id="proc-preview-first" type="checkbox" checked />
               <span>🎯 <strong>Validar cámara en el 1er clip</strong> antes de generar el resto del stream</span>
             </label>
+
+            <div class="field" style="margin: 4px 0 8px;">
+              <label for="proc-ai-engine">🏆 Títulos y ranking de clips al terminar</label>
+              <select id="proc-ai-engine">
+                <option value="">Solo local (instantáneo, sin IA)</option>
+                <option value="claude">Claude Code</option>
+                <option value="codex">Codex (ChatGPT)</option>
+                <option value="gemini">Gemini</option>
+              </select>
+              <p class="muted" style="font-size:11.5px;margin:4px 0 0;">Siempre se calcula un título y una puntuación local. Con IA se generan títulos virales y un ranking comparando todos los clips (solo se envía el texto de los subtítulos).</p>
+            </div>
 
             <details class="advanced-box">
               <summary>Opciones avanzadas (encuadre, modelo Whisper, rangos)</summary>
@@ -250,10 +295,17 @@
                 </div>
                 <div class="field">
                   <label for="proc-max">Duración máx (s)</label>
-                  <input id="proc-max" type="number" min="15" max="180" value="55" />
+                  <input id="proc-max" type="number" min="15" max="180" value="90" />
                 </div>
               </div>
-              <input id="proc-min" type="hidden" value="20" />
+              <div class="field">
+                <label for="proc-min">Duración mínima (s)</label>
+                <input id="proc-min" type="number" min="10" max="120" value="45" />
+              </div>
+              <label class="checkbox-row" style="margin:6px 0;">
+                <input id="proc-burn-title" type="checkbox" checked />
+                <span>🔤 Título de gancho arriba del video (primeros 5 s)</span>
+              </label>
               <div class="field">
                 <label for="proc-ranges">Rangos manuales opcionales (INICIO,FIN uno por línea)</label>
                 <textarea id="proc-ranges" rows="2" placeholder="Vacío = detección automática"></textarea>
@@ -334,6 +386,14 @@
               <button class="filter-pill" data-filter="discarded">Descartados</button>
             </div>
 
+            <div class="rank-toolbar">
+              <select id="clip-sort" aria-label="Ordenar clips">
+                <option value="rank" selected>🏆 Mejores primero</option>
+                <option value="time">⏱ Orden del video</option>
+              </select>
+              <button id="batch-evaluate-btn" class="btn btn-silver btn-compact" title="Genera títulos y rankea todos los clips del proyecto con el Motor IA seleccionado en Traducir">✨ Títulos + ranking IA</button>
+            </div>
+
             <div id="clip-selector" class="clip-cards-list"></div>
           </div>
 
@@ -343,6 +403,7 @@
               <input id="clip-title-input" type="text" class="title-inline" placeholder="Nombre del clip..." />
               <span id="clip-status-badge" class="badge off">Por revisar</span>
             </div>
+            <div id="clip-title-note" class="title-note hidden"></div>
 
             <div class="preview-wrap">
               <video id="clip-player" controls playsinline></video>
@@ -358,6 +419,14 @@
               <button id="clip-approve-quick-btn" class="btn btn-success">✅ Aprobar</button>
               <button id="clip-discard-btn" class="btn btn-danger">🗑️ Descartar</button>
             </div>
+
+            <div class="quick-clip-actions publish-actions">
+              <button id="clip-pub-youtube-btn" class="btn btn-outline">▶️ Subir a YouTube (privado)</button>
+              <button id="clip-pub-tiktok-btn" class="btn btn-outline">🎵 Subir a TikTok (borrador)</button>
+            </div>
+            <div id="clip-uploads" class="uploads-box hidden"></div>
+
+            <div id="clip-quality-card" class="quality-card hidden"></div>
           </div>
 
           <!-- RIGHT COLUMN: 1-CLICK AI TRANSLATION + MINI-EDITOR -->
@@ -475,6 +544,10 @@
                   <input id="ed-denoise" type="checkbox" checked />
                   <span>Limpiar audio</span>
                 </label>
+                <label class="checkbox-row" style="margin:0;" title="Quema el título del clip arriba del video durante los primeros 5 segundos">
+                  <input id="ed-burn-title" type="checkbox" checked />
+                  <span>Título en el video</span>
+                </label>
                 <button type="button" id="ed-apply-btn" class="btn btn-silver" style="margin-left:auto;">💾 Aplicar edición</button>
               </div>
             </div>
@@ -517,6 +590,70 @@
               <button id="pub-approve-btn" class="btn btn-silver">✅ Guardar y aprobar clip</button>
               <button id="pub-download-btn" class="btn btn-outline">⬇️ Descargar MP4</button>
             </div>
+          </div>
+
+          <div class="card">
+            <h3>🔐 Cuentas y subida automática</h3>
+            <p class="muted" style="font-size:12px;">Los clips se suben <strong>en privado</strong> a YouTube y como <strong>borrador</strong> a tu bandeja de TikTok: tú los revisas y los haces públicos. Las credenciales se guardan solo en <code>workspace/credentials/</code>.</p>
+
+            <h4 style="margin:12px 0 6px;">▶️ YouTube Shorts <span id="pub-yt-status" class="badge off">No conectado</span></h4>
+            <div class="field">
+              <label for="pub-yt-secret">Ruta de client_secret.json (Google Cloud → OAuth "App de escritorio")</label>
+              <input id="pub-yt-secret" type="text" placeholder="C:\Users\...\client_secret.json" />
+            </div>
+            <div class="field">
+              <label for="pub-yt-channel">ID del canal (UC…, opcional: se detecta al conectar)</label>
+              <input id="pub-yt-channel" type="text" placeholder="UCxxxxxxxxxxxxxxxxxxxxxx" />
+            </div>
+            <div class="actions">
+              <button id="pub-yt-connect" class="btn btn-silver btn-compact">Conectar YouTube</button>
+              <button id="pub-yt-disconnect" class="btn btn-ghost btn-compact">Desconectar</button>
+            </div>
+
+            <h4 style="margin:14px 0 6px;">🎵 TikTok <span id="pub-tt-status" class="badge off">No conectado</span></h4>
+            <div class="row-2">
+              <div class="field">
+                <label for="pub-tt-key">Client key</label>
+                <input id="pub-tt-key" type="text" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label for="pub-tt-secret">Client secret</label>
+                <input id="pub-tt-secret" type="password" autocomplete="off" />
+              </div>
+            </div>
+            <p class="muted" style="font-size:11.5px;">Redirect URI a registrar en tu app de TikTok (Login Kit → Desktop): <code id="pub-tt-redirect">http://localhost:3455/callback/</code></p>
+            <div class="actions">
+              <button id="pub-tt-connect" class="btn btn-silver btn-compact">Conectar TikTok</button>
+              <button id="pub-tt-disconnect" class="btn btn-ghost btn-compact">Desconectar</button>
+            </div>
+
+            <h4 style="margin:14px 0 6px;">🤖 Automático</h4>
+            <div class="row-3">
+              <div class="field">
+                <label for="pub-min-score">Puntaje mínimo</label>
+                <input id="pub-min-score" type="number" min="0" max="100" value="70" />
+              </div>
+              <div class="field">
+                <label for="pub-daily-limit">Máx. subidas / 24 h por red</label>
+                <input id="pub-daily-limit" type="number" min="1" max="20" value="5" />
+              </div>
+              <div class="field">
+                <label>Hoy</label>
+                <div id="pub-today" class="muted" style="padding-top:8px;">YT 0 · TT 0</div>
+              </div>
+            </div>
+            <div class="field">
+              <label for="pub-hashtags">Hashtags (descripción de YouTube)</label>
+              <input id="pub-hashtags" type="text" value="#shorts #gaming #twitch" />
+            </div>
+            <button id="pub-save-settings" class="btn btn-silver" style="width:100%;">💾 Guardar configuración</button>
+            <details class="advanced-box" style="margin-top:10px;">
+              <summary>Cómo obtener las credenciales</summary>
+              <ol style="font-size:12px;padding-left:18px;">
+                <li><strong>YouTube:</strong> console.cloud.google.com → crea un proyecto → habilita "YouTube Data API v3" → Pantalla de consentimiento (tipo Externo, agrégate como usuario de prueba) → Credenciales → ID de cliente OAuth tipo <em>App de escritorio</em> → descarga el JSON y pega su ruta arriba. Cada subida gasta ~1600 de 10 000 unidades diarias (≈6 videos/día).</li>
+                <li><strong>TikTok:</strong> developers.tiktok.com → crea una app → agrega <em>Login Kit</em> (Desktop, con la Redirect URI de arriba) y <em>Content Posting API</em> con el scope <code>video.upload</code> → copia Client key y Client secret. TikTok permite máx. 5 borradores pendientes cada 24 h.</li>
+              </ol>
+            </details>
           </div>
 
           <div class="card">

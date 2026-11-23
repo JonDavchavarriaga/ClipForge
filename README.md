@@ -29,15 +29,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\create_desktop_sho
 ## Funcionalidades Principales
 
 1. **📺 Live y Auto-Clip**:
-   - Reproduce Twitch, Kick o YouTube Live dentro de la app mientras grabas el stream completo (1h–2h+) en `workspace/live_recordings/`.
-   - Detecta picos de reacción para sacar clips automáticos (30s / 45s / 60s) e ignora bloques comerciales mudos de Twitch.
+   - Reproduce Twitch, Kick o YouTube Live dentro de la app. Por defecto **no** guarda el live completo: mantiene solo los últimos 15 min y borra lo más viejo para no llenar el disco (activa "💾 Guardar live completo" solo si lo necesitas; ocupa varios GB).
+   - Detecta picos de reacción y guarda **clips largos (45–90 s, 75 s por defecto)** con contexto antes del pico y la reacción completa después; ignora bloques comerciales mudos de Twitch.
+   - **Pipeline automático**: cada clip con puntaje ≥ mínimo (70 por defecto) se renderiza solo en 9:16 y, si lo activas, se sube **en privado a YouTube** y como **borrador a tu bandeja de TikTok** (configuración en la pestaña Publicar, con límite diario).
+   - **Resumen de cada clip de la sesión**: en "Clips de esta sesión" cada clip muestra título, resumen, puntuación y transcripción (local o con Claude/Codex/Gemini) para decidir qué generar antes de renderizar.
+   - **Idioma del streamer + filtro de voces del juego**: si el streamer habla español y el juego habla inglés (o al revés), elige el idioma del streamer y activa "🎮 Ignorar voces del juego en otro idioma": cada fragmento de voz se clasifica por idioma y los diálogos del juego no entran a subtítulos ni resúmenes. Si hay voces superpuestas al mismo tiempo no se pueden separar; para streams propios lo ideal es grabar el micrófono en una pista de audio aparte en OBS (`--audio-track`).
 2. **⚡ Generar Clips**:
-   - Calcula automáticamente cuántos clips sacar según la duración del stream, saltando comerciales mudos.
+   - Calcula automáticamente cuántos clips sacar según la duración del stream, saltando comerciales mudos. Prefiere clips de 45–90 s y siempre corta en un final de frase (nunca a mitad de un subtítulo).
+   - **Título de gancho quemado** arriba del video durante los primeros 5 s (editable en el Mini-Editor).
    - Permite recortar tu webcam visualmente sobre un fotograma (estilo Recortes de Windows) y validar el encuadre en el 1er clip antes de generar el resto.
    - **Sincronización exacta (0 ms de desfase)**: recorte dentro del filtergraph (`trim`/`atrim` + `setpts`) y alineación por clip (ver [ADR-002](docs/decisions/0002-zero-drift-filtergraph-subtitle-sync.md)).
 3. **🎬 Gestor de Clips, Traducción IA y Mini-Editor**:
    - **Gestor visual**: nombres legibles por proyecto, miniaturas reales 9:16, estados (`Por revisar`, `Aprobado`, `Descartado`), vaciado de descartados y **descarga directa de MP4 en 1 clic**.
    - **Traducción 1-clic (solo subtítulos)**: usa **Claude Code**, **Codex (ChatGPT)** o **Gemini** ya instalados en tu PC para traducir todo el clip con coherencia gamer sin tocar el audio original (ver [ADR-003](docs/decisions/0003-local-subscription-ai-subtitles.md)).
+   - **Títulos y ranking de clips**: cada clip recibe un título automático y una puntuación de calidad 0–100 (gancho inicial, voz continua, duración, final completo, ritmo, emoción) con fortalezas/debilidades. El gestor ordena por **🏆 Mejores primero** y, si tienes Claude Code / Codex / Gemini, genera títulos virales y un ranking comparando todo el lote (solo se envía el texto de los subtítulos).
    - **Mini-Editor integrado**: recorte rápido `IN aquí` / `OUT aquí`, 6 tarjetas visuales de estilos de subtítulos (`Amarillo Viral`, `Cian Gaming`, `Impacto Naranja`, `Gevik Plata`, `Blanco Limpio`, `Sin subtítulos`), altura exacta de subtítulos (`12%–90%`), tamaño de cámara split (`20%–52%`) con guías visuales sobre el video, sincronía fina (`-2000..+2000 ms`) y volumen/limpieza de audio.
 4. **📁 Biblioteca Local y Gestión de Espacio**:
    - Muestra el espacio ocupado (`MB`/`GB`), marca los lives ya procesados (`✓ Procesado`) y permite borrar lives completos y clips en vivo directamente desde la interfaz para liberar disco de forma segura.
@@ -53,8 +58,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\create_desktop_sho
 | `.\.venv\Scripts\python.exe clipforge.py app` | Abre **Gevik Clip** en ventana de escritorio local |
 | `powershell -ExecutionPolicy Bypass -File .\scripts\create_desktop_shortcut.ps1` | Genera `assets/icons/gevik-clip.ico` y crea `Gevik Clip.lnk` en el Escritorio |
 | `.\.venv\Scripts\python.exe clipforge.py live "<URL>" --clip-seconds 45` | Captura un stream desde consola con recorte instantáneo |
-| `.\.venv\Scripts\python.exe clipforge.py process "<video.mp4>" --layout split-cam --caption-style highlight` | Genera clips 9:16 desde CLI |
+| `.\.venv\Scripts\python.exe clipforge.py process "<video.mp4>" --layout split-cam --caption-style highlight` | Genera clips 9:16 desde CLI (añade `--language es --voice-filter` para subtitular solo al streamer) |
 | `.\.venv\Scripts\python.exe clipforge.py rerender "<lote>" clip-01 --srt "<captions.es.srt>" --caption-style silver` | Re-renderiza un clip puntual con nuevos subtítulos o estilo |
+| `.\.venv\Scripts\python.exe clipforge.py evaluate "<lote>" --engine claude` | Genera títulos y rankea los clips de un lote (sin `--engine` = solo puntuación local) |
 | `.\.venv\Scripts\python.exe -m unittest discover -v` | Ejecuta la suite completa de pruebas unitarias e integración |
 
 ---

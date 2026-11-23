@@ -137,7 +137,8 @@ class GevikProTests(unittest.TestCase):
             write_ass(cues, out_fire, 'fire', layout='split-cam', offset_ms=250, position='top')
             text_fire = out_fire.read_text(encoding='utf-8')
             self.assertIn('0:00:01.25', text_fire)
-            self.assertIn('0:00:02.75', text_fire)
+            # cue end 2.5s + 250ms offset + 250ms readability linger on the last page
+            self.assertIn('0:00:03.00', text_fire)
 
             out_silver = Path(tmp) / 'silver.ass'
             write_ass(cues, out_silver, 'silver', layout='center', offset_ms=-200, position='middle')
@@ -238,7 +239,8 @@ class GevikProTests(unittest.TestCase):
             self.assertTrue(ico_path.is_file() and ico_path.stat().st_size > 2000)
 
     def test_job_manager_cancel(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        # The cancelled worker thread may still flush its log on Windows while the dir is removed.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             try:
                 jm = JobManager(logs_dir=Path(tmp))
                 started = threading.Event()

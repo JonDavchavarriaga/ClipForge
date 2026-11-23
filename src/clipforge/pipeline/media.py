@@ -12,8 +12,8 @@ from array import array
 from dataclasses import dataclass
 from pathlib import Path
 
-from clipforge.logging_utils import ensure_safe_stdio
-from clipforge.pipeline.highlights import Cue, WordTiming
+from clipforge.logging_utils import ensure_safe_stdio, log_event
+from clipforge.pipeline.highlights import Cue, WordTiming, group_words_into_cues
 from clipforge.process_manager import BACKGROUND_FLAGS, CREATE_NO_WINDOW, REGISTRY
 
 NO_WINDOW_FLAGS = CREATE_NO_WINDOW
@@ -189,41 +189,154 @@ def _get_whisper_model(model_name: str):
         return _CACHED_MODEL
 
 
-def speech(path, model_name, language):
+# Gevik Clip is an EN<->ES product: Whisper's auto-detection on noisy gameplay audio often guesses
+# unrelated languages (seen in practice: Finnish, then Greek, for a Spanish stream).
+AUTO_LANGUAGES = ('es', 'en')
+
+
+def resolve_auto_language(detected: str | None, all_probs) -> str:
+    """Keep Whisper's detection when it is ES/EN; otherwise pick the likelier of ES and EN."""
+    if detected in AUTO_LANGUAGES:
+        return detected
+    probs = dict(all_probs or [])
+    return max(AUTO_LANGUAGES, key=lambda lang: probs.get(lang, 0.0))
+
+
+def _probe_windows(audio, sample_rate: int = 16000, window_s: int = 40):
+    """Return up to 3 short audio slices (25/50/75%) so probing a 2h stream stays fast."""
+    total = len(audio)
+    window = window_s * sample_rate
+    if total <= 3 * window:
+        return [audio]
+    import numpy as np
+
+    return [np.ascontiguousarray(audio[int(total * f) - window // 2:int(total * f) + window // 2]) for f in (0.25, 0.5, 0.75)]
+
+
+def _probe_best_language(model, audio) -> str | None:
+    """Transcribe a probe in ES and EN and keep the language Whisper is more confident in."""
+    scores: dict[str, float] = {}
+    for lang in AUTO_LANGUAGES:
+        weighted = 0.0
+        total = 0.0
+        for chunk in _probe_windows(audio):
+            segments, _ = model.transcribe(chunk, language=lang, vad_filter=True, condition_on_previous_text=False)
+            for segment in segments:
+                length = max(0.1, segment.end - segment.start)
+                weighted += segment.avg_logprob * length
+                total += length
+        if total:
+            scores[lang] = weighted / total
+    if not scores:
+        return None
+    return max(scores, key=scores.get)
+
+
+# Per-segment voice filter: streams mix the streamer's voice (e.g. ES) with game dialogue in another
+# language (e.g. EN). Whisper's language detector separates them reliably (~0.99) on each segment.
+FOREIGN_MIN_SECONDS = 0.6
+FOREIGN_OTHER_MIN_PROB = 0.5
+FOREIGN_KEEP_MAX_PROB = 0.2
+
+
+def is_foreign_speech(probs, keep: str) -> bool:
+    """True when the audio is clearly the *other* EN/ES language and clearly not the streamer's."""
+    other = next((lang for lang in AUTO_LANGUAGES if lang != keep), None)
+    p = dict(probs or [])
+    return other is not None and p.get(other, 0.0) >= FOREIGN_OTHER_MIN_PROB and p.get(keep, 0.0) < FOREIGN_KEEP_MAX_PROB
+
+
+def drop_foreign_segments(model, audio, segments, keep: str, sample_rate: int = 16000):
+    """Remove Whisper segments spoken in the other language (game dialogue / NPCs / cinematics).
+
+    Segments shorter than FOREIGN_MIN_SECONDS are too short to classify: they inherit the decision of
+    the previous classified segment when they follow it closely, otherwise they are kept.
+    Returns (kept_segments, dropped_count).
+    """
+    if keep not in AUTO_LANGUAGES:
+        return list(segments), 0
+    decisions: list[bool | None] = []
+    for segment in segments:
+        if segment.end - segment.start < FOREIGN_MIN_SECONDS:
+            decisions.append(None)
+            continue
+        chunk = audio[int(segment.start * sample_rate):int(segment.end * sample_rate)]
+        _, _, probs = model.detect_language(audio=chunk)
+        decisions.append(is_foreign_speech(probs, keep))
+    kept = []
+    dropped = 0
+    previous_decision = False
+    previous_end = -10.0
+    for segment, decision in zip(segments, decisions):
+        if decision is None:
+            decision = previous_decision if segment.start - previous_end < 0.4 else False
+        else:
+            previous_decision = decision
+        previous_end = segment.end
+        if decision:
+            dropped += 1
+        else:
+            kept.append(segment)
+    return kept, dropped
+
+
+def transcribe(path, model_name, language, *, voice_filter: bool = False) -> tuple[list[Cue], str | None]:
+    """Transcribe a 16 kHz WAV with word timings and return (cues, resolved_language).
+
+    voice_filter=True keeps only speech in the resolved streamer language (ES or EN), dropping game
+    dialogue in the other language. It costs ~1 language detection per segment, so use it on clips,
+    not on multi-hour recordings.
+    """
     ensure_safe_stdio()
     audio = load_wav_float32(Path(path))
     if audio.size == 0:
-        return []
+        return [], None if language == 'auto' else language
     model = _get_whisper_model(model_name)
-    segments, _ = model.transcribe(
-        audio, language=None if language == 'auto' else language,
-        word_timestamps=True, vad_filter=True, condition_on_previous_text=False,
-    )
+    options = dict(word_timestamps=True, vad_filter=True, condition_on_previous_text=False)
+    segments, info = model.transcribe(audio, language=None if language == 'auto' else language, **options)
+    resolved = language
+    if language == 'auto':
+        detected = getattr(info, 'language', None)
+        if detected in AUTO_LANGUAGES:
+            resolved = detected
+        else:
+            # Segments are lazy: nothing was decoded yet. Pick ES/EN by real transcription confidence
+            # on a short probe, then re-run forcing that language.
+            resolved = _probe_best_language(model, audio) or resolve_auto_language(
+                detected, getattr(info, 'all_language_probs', None))
+            segments, info = model.transcribe(audio, language=resolved, **options)
 
-    cues = []
+    segments = list(segments)
+    if voice_filter and resolved in AUTO_LANGUAGES:
+        total = len(segments)
+        segments, dropped = drop_foreign_segments(model, audio, segments, resolved)
+        if dropped:
+            log_event('pipeline.asr', 'foreign_speech_filtered', {
+                'keep_language': resolved, 'dropped_segments': dropped, 'total_segments': total,
+            })
+
+    # Flatten word timings across Whisper segments, then regroup by punctuation/pauses so
+    # captions never split mid-phrase or flash 1-word fragments on screen.
+    cues: list[Cue] = []
+    pending_words: list[WordTiming] = []
     for segment in segments:
-        group = []
-        for word in segment.words or []:
-            if group and (len(group) >= 6 or word.end - group[0].start > 2.4
-                          or len(''.join(item.word for item in group) + word.word) > 38):
-                timings = tuple(
-                    WordTiming(item.start, item.end, item.word.strip())
-                    for item in group
-                    if item.word.strip()
-                )
-                cues.append(Cue(group[0].start, group[-1].end, ''.join(item.word for item in group).strip(), timings))
-                group.clear()
-            group.append(word)
-        if group:
-            timings = tuple(
-                WordTiming(item.start, item.end, item.word.strip())
-                for item in group
+        if segment.words:
+            pending_words.extend(
+                WordTiming(float(item.start), float(item.end), item.word.strip())
+                for item in segment.words
                 if item.word.strip()
             )
-            cues.append(Cue(group[0].start, group[-1].end, ''.join(item.word for item in group).strip(), timings))
-        elif segment.text.strip() and not segment.words:
+        elif segment.text.strip():
+            cues.extend(group_words_into_cues(pending_words))
+            pending_words = []
             cues.append(Cue(segment.start, segment.end, segment.text.strip()))
-    return cues
+    cues.extend(group_words_into_cues(pending_words))
+    return sorted(cues, key=lambda cue: cue.start), resolved
+
+
+def speech(path, model_name, language, *, voice_filter: bool = False):
+    """Backward-compatible wrapper returning only the cues."""
+    return transcribe(path, model_name, language, voice_filter=voice_filter)[0]
 
 
 def detect_cam_region(source, start, duration) -> CamRegion:
@@ -399,11 +512,14 @@ def render(
     cam_region=None,
     cam_split_pct: int = 33,
     volume_db: float = 0.0,
+    title_file: Path | None = None,
     cancel_event: threading.Event | None = None,
 ):
     target = Path(target)
     temp_target = target.with_name(f'.tmp-{target.name}')
     caption_step = _caption_filter(has_captions, captions_file)
+    # Static hook title (title.ass, same folder as the output) drawn on top of the captions.
+    title_step = f'ass={Path(title_file).name}' if title_file else None
     pre, fine, duration = _seek_window(start, float(end) - float(start))
     args: list = []
     if pre > 0.0:
@@ -425,6 +541,8 @@ def render(
         post_steps = ['vstack=inputs=2', f'drawbox=x=0:y={top_h - 2}:w=1080:h=4:color=black@0.85:t=fill']
         if caption_step:
             post_steps.append(caption_step)
+        if title_step:
+            post_steps.append(title_step)
         graph = (
             f'[0:v:0]{vtrim},scale=trunc(iw*sar/2)*2:ih,setsar=1,fps=30,split=2[vcam][vgame];'
             f'[vcam]{top_crop},scale=1080:{top_h}:force_original_aspect_ratio=increase,crop=1080:{top_h}[top];'
@@ -448,6 +566,8 @@ def render(
             ])
         if caption_step:
             filters.append(caption_step)
+        if title_step:
+            filters.append(title_step)
         args.extend(['-map', '0:v:0', '-vf', ','.join(filters)])
 
     if track is not None:
