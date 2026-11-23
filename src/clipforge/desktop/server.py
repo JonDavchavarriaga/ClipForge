@@ -46,8 +46,18 @@ from clipforge.logging_utils import (
     record_error,
 )
 from clipforge.pipeline.auto_translate import available_translators, translate_clip_with_agent
+from clipforge.pipeline.clip_insights import apply_local_insights, evaluate_batch, rank_clips
+from clipforge.pipeline.highlights import read_srt
 from clipforge.pipeline.editor import edit_clip
 from clipforge.pipeline.live import LiveRecorder, parse_stream_embed
+from clipforge.pipeline.live_summary import LiveClipSummarizer
+from clipforge.publishing.auto_publish import (
+    PLATFORMS_AUTO,
+    PublishStore,
+    publish_clip,
+    tiktok_connect_interactive,
+    youtube_connect_interactive,
+)
 from clipforge.pipeline.media import NO_WINDOW_FLAGS, extract_frame_jpg, generate_thumbnail, probe
 from clipforge.pipeline.subtitles import CAPTION_STYLES, style_catalog
 from clipforge.process_manager import REGISTRY
@@ -90,9 +100,67 @@ class ClipForgeAppState:
             'layout': 'split-cam',
             'cam_region': 'auto',
             'caption_style': 'highlight',
-            'language': 'auto',
+            'language': 'es',
             'model': 'base',
             'denoise': True,
+            'voice_filter': True,
+            'summary': True,
+            'summary_engine': None,
+            'auto_render': 'score',   # off | score | all
+            'min_score': 70,
+            'auto_publish': [],       # subset of ('youtube', 'tiktok')
+        }
+        self.publisher = PublishStore(self.workspace.root)
+        self.summarizer = LiveClipSummarizer(self._on_live_summary, logs_dir=self.workspace.logs_dir)
+
+    def _on_live_summary(self, clip_id: str, fields: dict) -> None:
+        """Store the live clip analysis and, for good clips, render + publish them automatically."""
+        self.recorder.update_clip(clip_id, fields)
+        if fields.get('analysis') != 'done':
+            return
+        cfg = self.auto_process_config
+        mode = cfg.get('auto_render', 'off')
+        score = fields.get('score')
+        min_score = int(cfg.get('min_score', 70))
+        if mode == 'off' or (mode == 'score' and (score is None or score < min_score)):
+            if mode == 'score':
+                self.recorder.update_clip(clip_id, {'auto_status': f'No se renderiza: {score}/100 < {min_score}'})
+            return
+        record = next((c for c in self.recorder.status()['clips'] if c['clip_id'] == clip_id), None)
+        if record is None:
+            return
+        job = self.submit_auto_pipeline(record['path'], int(record['window_seconds']), label_prefix='Auto')
+        self.recorder.update_clip(clip_id, {'auto_status': 'En cola para renderizar', 'auto_job': job.id})
+
+    def summarize_live_clip(self, record) -> None:
+        """Queue a background title/summary for a just-saved live clip (if enabled)."""
+        cfg = self.auto_process_config
+        if not cfg.get('summary', True):
+            return
+        self.summarizer.submit(record.clip_id, record.path, {
+            'language': cfg.get('language') or 'es',
+            'model': cfg.get('model') or 'base',
+            'voice_filter': bool(cfg.get('voice_filter', True)),
+            'engine': cfg.get('summary_engine'),
+        })
+
+    def live_process_payload(self, record, window: int, overrides: dict | None = None) -> dict:
+        cfg = {**self.auto_process_config, **{k: v for k, v in (overrides or {}).items() if v not in (None, '')}}
+        return {
+            'source': record.path,
+            'rights': 'local',
+            'layout': cfg['layout'],
+            'cam_region': cfg['cam_region'],
+            'caption_style': cfg['caption_style'],
+            'language': cfg['language'],
+            'model': cfg['model'],
+            'count': 1,
+            'preview_first': False,
+            'min_seconds': min(45, max(10, window - 5)),
+            'max_seconds': max(90, window),
+            'denoise': bool(cfg.get('denoise', True)),
+            'voice_filter': bool(cfg.get('voice_filter', True)),
+            'burn_title': True,
         }
 
     def _scan_videos(self, folders: list[Path], limit: int = 40) -> list[dict]:
@@ -284,6 +352,14 @@ class ClipForgeAppState:
                 approval_path = clip_dir / 'approval.json'
                 approval = json.loads(approval_path.read_text(encoding='utf-8')) if approval_path.is_file() else None
                 status = clip.get('review_status') or ('approved' if approval else 'pending')
+                if clip_dir.is_dir():
+                    # Re-score on the fly with the current rules (not persisted); a stored AI score is kept.
+                    srt = clip_dir / 'captions.srt'
+                    try:
+                        legacy_cues = read_srt(srt) if srt.is_file() else []
+                    except ValueError:
+                        legacy_cues = []
+                    clip = apply_local_insights(dict(clip), legacy_cues)
                 trans_files = sorted(p.name for p in clip_dir.glob('translation-*.json'))
                 srt_files = sorted(p.name for p in clip_dir.glob('captions*.srt'))
                 enriched.append({
@@ -301,8 +377,13 @@ class ClipForgeAppState:
                     'srt_files': srt_files,
                     'has_thumb': (clip_dir / 'thumb.jpg').is_file(),
                 })
+            ranks = rank_clips(enriched)
+            for item in enriched:
+                item['rank'] = ranks.get(item['id'])
+                item['is_best'] = ranks.get(item['id']) == 1 and len(ranks) > 1
             batches.append({
                 'id': folder.name,
+                'evaluated_with': manifest.get('evaluated_with', 'local'),
                 'display_name': self._fallback_display_name(folder, manifest),
                 'path': str(folder),
                 'source': manifest.get('source', ''),
@@ -338,38 +419,7 @@ class ClipForgeAppState:
         return folder, clip_dir
 
     def submit_process_job(self, data: dict):
-        source_raw = str(data.get('source') or '').strip()
-        if not source_raw:
-            raise ValueError('Elige un video o pega la ruta del archivo local.')
-        source_path = Path(source_raw)
-        if not source_path.is_file():
-            raise ValueError(f'No se encontró el archivo: {source_path}')
-        ranges_raw = str(data.get('ranges') or '').strip()
-        ranges = [line.strip() for line in ranges_raw.splitlines() if line.strip()] if ranges_raw else []
-        raw_count = data.get('count', 0)
-        count = 0 if str(raw_count).strip().lower() in {'', 'auto', '0', 'none'} else int(raw_count)
-        preview_first = bool(data.get('preview_first', True))
-
-        args = SimpleNamespace(
-            source=source_path,
-            output=self.outputs_dir,
-            count=count,
-            min_seconds=int(data.get('min_seconds') or 20),
-            max_seconds=int(data.get('max_seconds') or 55),
-            range=ranges,
-            layout=str(data.get('layout') or 'split-cam'),
-            cam_region=str(data.get('cam_region') or 'auto'),
-            caption_style=str(data.get('caption_style') or 'highlight'),
-            preview_first=preview_first,
-            srt=Path(data['srt']) if data.get('srt') else None,
-            skip_asr=bool(data.get('skip_asr', False)),
-            model=str(data.get('model') or 'base'),
-            language=str(data.get('language') or 'auto'),
-            denoise=bool(data.get('denoise', True)),
-            audio_track=int(data['audio_track']) if data.get('audio_track') not in (None, '') else None,
-            rights=str(data.get('rights') or 'local'),
-            rights_note=str(data.get('rights_note') or ''),
-        )
+        args = self._process_args(data)
 
         def run_process(progress, cancel_event):
             folder = process(args, progress_cb=progress, cancel_event=cancel_event)
@@ -383,8 +433,95 @@ class ClipForgeAppState:
                 'remaining_count': manifest.get('remaining_count', 0),
             }
 
-        mode_tag = '1er clip prueba' if preview_first else ('Auto clips' if count == 0 else f'{count} clips')
-        return self.jobs.submit('process', f'{source_path.name} ({mode_tag})', run_process)
+        mode_tag = '1er clip prueba' if args.preview_first else ('Auto clips' if args.count == 0 else f'{args.count} clips')
+        return self.jobs.submit('process', f'{args.source.name} ({mode_tag})', run_process)
+
+    def submit_auto_pipeline(self, source_path: str, window: int, *, label_prefix: str = 'Auto',
+                             overrides: dict | None = None):
+        """Render a live clip in 9:16 and, if it scores high enough, upload it (YouTube private / TikTok draft)."""
+        cfg = dict(self.auto_process_config)
+        record = SimpleNamespace(path=source_path)
+        payload = self.live_process_payload(record, window, overrides)
+        payload['ai_engine'] = cfg.get('summary_engine')
+        args = self._process_args(payload)
+        platforms = [p for p in cfg.get('auto_publish') or [] if p in PLATFORMS_AUTO]
+        min_score = int(cfg.get('min_score', 70))
+        publisher = self.publisher
+
+        def run_pipeline(progress, cancel_event):
+            folder = process(args, progress_cb=progress, cancel_event=cancel_event)
+            manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
+            clip = manifest['clips'][0]
+            if clip.get('burn_title') and clip.get('title_burned') != clip.get('display_title'):
+                # The AI produced a better title after rendering: burn the new one before uploading.
+                clip = edit_clip(folder, clip['id'], progress_cb=progress, cancel_event=cancel_event)
+            score = int((clip.get('quality') or {}).get('score', 0))
+            result = {
+                'batch_path': str(folder),
+                'batch_id': folder.name,
+                'clip_id': clip['id'],
+                'display_name': manifest.get('display_name', folder.name),
+                'status': manifest.get('status', 'complete'),
+                'score': score,
+                'title': clip.get('display_title'),
+            }
+            if platforms:
+                if score >= min_score:
+                    progress('Subiendo', 97, f'Subiendo "{clip.get("display_title")}" ({score}/100)...')
+                    result['uploads'] = publish_clip(publisher, folder, clip['id'], platforms)
+                else:
+                    result['upload_skipped'] = f'Puntaje {score}/100 por debajo del mínimo {min_score}'
+            return result
+
+        name = Path(source_path).name
+        return self.jobs.submit('auto-pipeline', f'{label_prefix}: {name} → 9:16' + (' + subir' if platforms else ''),
+                                run_pipeline)
+
+    def _process_args(self, data: dict) -> SimpleNamespace:
+        source_raw = str(data.get('source') or '').strip()
+        if not source_raw:
+            raise ValueError('Elige un video o pega la ruta del archivo local.')
+        source_path = Path(source_raw)
+        if not source_path.is_file():
+            raise ValueError(f'No se encontró el archivo: {source_path}')
+        ranges_raw = str(data.get('ranges') or '').strip()
+        ranges = [line.strip() for line in ranges_raw.splitlines() if line.strip()] if ranges_raw else []
+        raw_count = data.get('count', 0)
+        count = 0 if str(raw_count).strip().lower() in {'', 'auto', '0', 'none'} else int(raw_count)
+        preview_first = bool(data.get('preview_first', True))
+
+        return SimpleNamespace(
+            source=source_path,
+            output=self.outputs_dir,
+            count=count,
+            min_seconds=int(data.get('min_seconds') or 45),
+            max_seconds=int(data.get('max_seconds') or 90),
+            range=ranges,
+            layout=str(data.get('layout') or 'split-cam'),
+            cam_region=str(data.get('cam_region') or 'auto'),
+            caption_style=str(data.get('caption_style') or 'highlight'),
+            preview_first=preview_first,
+            srt=Path(data['srt']) if data.get('srt') else None,
+            skip_asr=bool(data.get('skip_asr', False)),
+            model=str(data.get('model') or 'base'),
+            language=str(data.get('language') or 'auto'),
+            denoise=bool(data.get('denoise', True)),
+            audio_track=int(data['audio_track']) if data.get('audio_track') not in (None, '') else None,
+            rights=str(data.get('rights') or 'local'),
+            rights_note=str(data.get('rights_note') or ''),
+            ai_engine=_clean_engine(data.get('ai_engine')),
+            voice_filter=bool(data.get('voice_filter', False)),
+            burn_title=bool(data.get('burn_title', True)),
+        )
+
+
+def _clean_engine(raw) -> str | None:
+    engine = str(raw or '').strip().lower()
+    if not engine or engine in {'none', 'local', 'off'}:
+        return None
+    if engine not in {'claude', 'codex', 'gemini'}:
+        raise ValueError('Motor IA inválido. Usa claude, codex o gemini.')
+    return engine
 
 
 def make_handler(state: ClipForgeAppState):
@@ -556,6 +693,9 @@ def make_handler(state: ClipForgeAppState):
                         return
                     self._send_json({'job': job})
                     return
+                if path == '/api/publish':
+                    self._send_json({'publish': state.publisher.public_status()})
+                    return
                 if path == '/api/live/status':
                     self._send_json({'live': state.recorder.status()})
                     return
@@ -658,39 +798,40 @@ def make_handler(state: ClipForgeAppState):
                     return
                 if path == '/api/live/start':
                     auto_process = bool(data.get('auto_process', False))
+                    auto_render = str(data.get('auto_render') or ('all' if auto_process else 'score')).strip().lower()
+                    if auto_render not in {'off', 'score', 'all'}:
+                        raise ValueError('auto_render inválido. Usa off, score o all.')
+                    min_score = max(0, min(100, int(data.get('min_score') or state.publisher.settings()['auto']['min_score'])))
+                    auto_publish = [p for p in (data.get('auto_publish') or []) if p in PLATFORMS_AUTO]
+                    language = str(data.get('language') or 'es').strip().lower()
+                    if language not in {'es', 'en', 'auto'}:
+                        raise ValueError('Idioma del streamer inválido. Usa es, en o auto.')
                     state.auto_process_config = {
-                        'enabled': auto_process,
+                        'enabled': auto_render != 'off',
                         'layout': str(data.get('layout') or 'split-cam'),
                         'cam_region': str(data.get('cam_region') or 'auto'),
                         'caption_style': str(data.get('caption_style') or 'highlight'),
-                        'language': str(data.get('language') or 'auto'),
+                        'language': language,
                         'model': str(data.get('model') or 'base'),
                         'denoise': bool(data.get('denoise', True)),
+                        'voice_filter': bool(data.get('voice_filter', True)),
+                        'summary': True,
+                        'summary_engine': _clean_engine(data.get('summary_engine')),
+                        'auto_render': auto_render,
+                        'min_score': min_score,
+                        'auto_publish': auto_publish,
                     }
 
                     def on_auto_clip(record):
-                        if state.auto_process_config.get('enabled'):
-                            state.submit_process_job({
-                                'source': record.path,
-                                'rights': 'local',
-                                'layout': state.auto_process_config['layout'],
-                                'cam_region': state.auto_process_config['cam_region'],
-                                'caption_style': state.auto_process_config['caption_style'],
-                                'language': state.auto_process_config['language'],
-                                'model': state.auto_process_config['model'],
-                                'count': 1,
-                                'preview_first': False,
-                                'min_seconds': max(10, min(record.window_seconds, 20)),
-                                'max_seconds': max(record.window_seconds, 60),
-                                'denoise': state.auto_process_config['denoise'],
-                            })
+                        # Rendering/publishing is decided once the summary (score) is ready: see _on_live_summary
+                        state.summarize_live_clip(record)
 
                     status = state.recorder.start(
                         str(data.get('url') or ''),
                         rights_kind=str(data.get('rights') or 'local'),
                         rights_note=str(data.get('rights_note') or ''),
                         quality=str(data.get('quality') or 'best'),
-                        save_full_recording=bool(data.get('save_full_recording', True)),
+                        save_full_recording=bool(data.get('save_full_recording', False)),
                         auto_clip=bool(data.get('auto_clip', True)),
                         auto_clip_seconds=int(data.get('auto_clip_seconds') or 45),
                         auto_sensitivity=str(data.get('auto_sensitivity') or 'medium'),
@@ -713,22 +854,13 @@ def make_handler(state: ClipForgeAppState):
                 if path == '/api/live/clip':
                     window = int(data.get('window_seconds') or 45)
                     record = state.recorder.save_clip(window, mode='manual', reason=f'Clip manual ({window}s)')
+                    state.summarize_live_clip(record)
                     auto_process = bool(data.get('auto_process', False))
                     job_dict = None
                     if auto_process:
-                        job = state.submit_process_job({
-                            'source': record.path,
-                            'rights': 'local',
-                            'layout': data.get('layout') or state.auto_process_config['layout'],
-                            'cam_region': data.get('cam_region') or state.auto_process_config['cam_region'],
-                            'caption_style': data.get('caption_style') or state.auto_process_config['caption_style'],
-                            'language': data.get('language') or state.auto_process_config['language'],
-                            'model': data.get('model') or state.auto_process_config['model'],
-                            'count': 1,
-                            'preview_first': False,
-                            'min_seconds': max(10, min(window, 20)),
-                            'max_seconds': max(window, 60),
-                            'denoise': bool(data.get('denoise', True)),
+                        job = state.submit_auto_pipeline(record.path, window, label_prefix='Manual', overrides={
+                            key: data.get(key)
+                            for key in ('layout', 'cam_region', 'caption_style', 'language', 'model')
                         })
                         job_dict = job.to_dict()
                     self._send_json({'clip': vars(record), 'live': state.recorder.status(), 'job': job_dict})
@@ -780,7 +912,10 @@ def make_handler(state: ClipForgeAppState):
                     if new_status:
                         clip['review_status'] = new_status
                     if new_title is not None and str(new_title).strip():
-                        clip['display_title'] = str(new_title).strip()[:80]
+                        cleaned_title = str(new_title).strip()[:80]
+                        if cleaned_title != clip.get('display_title'):
+                            clip['display_title'] = cleaned_title
+                            clip['title_source'] = 'user'
                     save_json(manifest_path, manifest)
                     self._send_json({'clip': clip})
                     return
@@ -873,6 +1008,8 @@ def make_handler(state: ClipForgeAppState):
                             subtitle_offset_ms=int(data['subtitle_offset_ms']) if data.get('subtitle_offset_ms') not in (None, '') else None,
                             denoise=bool(data['denoise']) if data.get('denoise') is not None else None,
                             volume_db=float(data['volume_db']) if data.get('volume_db') not in (None, '') else None,
+                            burn_title=bool(data['burn_title']) if data.get('burn_title') is not None else None,
+                            title=str(data['title']) if data.get('title') else None,
                             progress_cb=progress,
                             cancel_event=cancel_event,
                         )
@@ -912,6 +1049,7 @@ def make_handler(state: ClipForgeAppState):
                     layout = str(data.get('layout') or '') or None
                     cam_region = str(data.get('cam_region') or '') or None
                     caption_style = str(data.get('caption_style') or '') or None
+                    ai_engine = _clean_engine(data.get('ai_engine'))
 
                     def run_continue(progress, cancel_event):
                         manifest = continue_batch(
@@ -919,12 +1057,73 @@ def make_handler(state: ClipForgeAppState):
                             layout=layout,
                             cam_region_spec=cam_region,
                             caption_style=caption_style,
+                            ai_engine=ai_engine,
                             progress_cb=progress,
                             cancel_event=cancel_event,
                         )
                         return {'batch_id': batch_id, 'clips_count': len(manifest.get('clips', []))}
 
                     job = state.jobs.submit('continue-batch', f'Generar resto de {batch_id}', run_continue)
+                    self._send_json({'job': job.to_dict()}, HTTPStatus.ACCEPTED)
+                    return
+                if path == '/api/publish/settings':
+                    state.publisher.update_settings(data)
+                    self._send_json({'publish': state.publisher.public_status()})
+                    return
+                if path == '/api/publish/disconnect':
+                    platform = str(data.get('platform') or '')
+                    token = {'youtube': state.publisher.youtube_token, 'tiktok': state.publisher.tiktok_token}.get(platform)
+                    if token is None:
+                        raise ValueError('Plataforma inválida.')
+                    token.unlink(missing_ok=True)
+                    self._send_json({'publish': state.publisher.public_status()})
+                    return
+                if path in ('/api/publish/youtube/connect', '/api/publish/tiktok/connect'):
+                    platform = 'youtube' if 'youtube' in path else 'tiktok'
+                    connect = youtube_connect_interactive if platform == 'youtube' else tiktok_connect_interactive
+
+                    def run_connect(progress, cancel_event, connect=connect, platform=platform):
+                        progress('Autorizando', 30, f'Se abrió el navegador: inicia sesión y autoriza {platform}...')
+                        info = connect(state.publisher)
+                        return {'platform': platform, **info}
+
+                    job = state.jobs.submit('connect', f'Conectar {platform}', run_connect)
+                    self._send_json({'job': job.to_dict()}, HTTPStatus.ACCEPTED)
+                    return
+                if path == '/api/clip/publish':
+                    batch_id = str(data.get('batch') or '')
+                    clip_id = str(data.get('clip') or '')
+                    platforms = [p for p in (data.get('platforms') or []) if p in PLATFORMS_AUTO]
+                    if not platforms:
+                        raise ValueError('Elige YouTube y/o TikTok.')
+                    folder, _ = state.resolve_clip_dir(batch_id, clip_id)
+
+                    def run_publish(progress, cancel_event):
+                        progress('Subiendo', 30, f'Subiendo {clip_id} a {", ".join(platforms)}...')
+                        uploads = publish_clip(state.publisher, folder, clip_id, platforms, respect_daily_limit=False)
+                        return {'batch_id': batch_id, 'clip_id': clip_id, 'uploads': uploads}
+
+                    job = state.jobs.submit('publish', f'Subir {clip_id} ({", ".join(platforms)})', run_publish)
+                    self._send_json({'job': job.to_dict()}, HTTPStatus.ACCEPTED)
+                    return
+                if path == '/api/batch/evaluate':
+                    batch_id = str(data.get('batch') or '')
+                    folder = state.resolve_batch_dir(batch_id)
+                    engine = _clean_engine(data.get('engine'))
+                    context = str(data.get('context') or '').strip()[:300]
+
+                    def run_evaluate(progress, cancel_event):
+                        result = evaluate_batch(
+                            folder,
+                            engine=engine,
+                            context=context,
+                            progress_cb=progress,
+                            cancel_event=cancel_event,
+                        )
+                        return {'batch_id': batch_id, **result}
+
+                    label = f'Títulos y ranking · {engine}' if engine else 'Ranking local'
+                    job = state.jobs.submit('evaluate-batch', f'{label} · {batch_id}', run_evaluate)
                     self._send_json({'job': job.to_dict()}, HTTPStatus.ACCEPTED)
                     return
                 if path == '/api/translation/pack':
@@ -1071,8 +1270,9 @@ def make_handler(state: ClipForgeAppState):
                     for c in manifest.get('clips', []):
                         if c['id'] == clip_id:
                             c['review_status'] = 'approved'
-                            if data.get('title'):
+                            if data.get('title') and str(data['title']).strip()[:80] != c.get('display_title'):
                                 c['display_title'] = str(data['title']).strip()[:80]
+                                c['title_source'] = 'user'
                     save_json(manifest_path, manifest)
                     _, clips = read_run(folder)
                     clip = next(item for item in clips if item['id'] == clip_id)
@@ -1090,6 +1290,7 @@ def make_handler(state: ClipForgeAppState):
                     log_event('server', 'shutdown_requested', {}, logs_dir=state.workspace.logs_dir)
                     state.jobs.cancel_all()
                     state.recorder.stop()
+                    state.summarizer.shutdown()
                     state.shutdown_event.set()
                     self._send_json({'ok': True})
                     return

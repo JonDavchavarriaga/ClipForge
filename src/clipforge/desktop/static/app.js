@@ -6,6 +6,10 @@ const state = {
   selectedBatchId: '',
   selectedClipId: '',
   clipFilter: 'active',
+  clipSort: 'rank',
+  translators: {},
+  viewAll: true,
+  publish: null,
   currentBundle: null,
   currentEmbedUrl: '',
   completedJobIds: new Set(),
@@ -65,6 +69,7 @@ function switchTab(name) {
   document.querySelectorAll('.tab-panel').forEach((p) => p.classList.toggle('active', p.id === `tab-${name}`));
   if (name === 'library') refreshLibrary();
   if (name === 'review') refreshBatches();
+  if (name === 'publish') refreshPublish();
 }
 
 document.querySelectorAll('.nav-btn').forEach((btn) => {
@@ -196,19 +201,55 @@ function renderLiveStatus(live) {
     list.innerHTML = '<div class="muted">Los clips manuales y automáticos aparecerán aquí.</div>';
     return;
   }
+  // Keep open transcript <details> open across the 2s polling re-render
+  const openTranscripts = new Set(
+    Array.from(list.querySelectorAll('details[open]')).map((d) => d.dataset.clip),
+  );
   list.innerHTML = '';
   live.clips.slice().reverse().forEach((clip) => {
     const row = document.createElement('div');
-    row.className = 'list-item';
+    row.className = 'list-item live-clip-item';
     const badgeClass = clip.mode === 'auto' ? 'auto' : 'ok';
     const badgeLabel = clip.mode === 'auto' ? '⚡ AUTO' : 'MANUAL';
+    const analyzing = clip.analysis === 'pending' || clip.analysis === 'running';
+    let title = esc(clip.clip_id);
+    let summary = '';
+    if (analyzing) {
+      summary = '<div class="live-clip-summary">⏳ Analizando de qué trata el clip…</div>';
+    } else if (clip.analysis === 'done') {
+      title = esc(clip.title || clip.clip_id);
+      summary = `<div class="live-clip-summary">${esc(clip.summary || '')}</div>`;
+    } else if (clip.analysis === 'error') {
+      summary = `<div class="live-clip-summary">⚠️ No se pudo analizar: ${esc(clip.analysis_warning || '')}</div>`;
+    }
+    const scoreBadge = clip.analysis === 'done' && clip.score != null
+      ? `<span class="badge ${scoreClass(clip.score)}" title="${esc(clip.verdict || '')}">${clip.score}/100</span>`
+      : '';
+    const warn = clip.analysis === 'done' && clip.analysis_warning
+      ? `<span title="${esc(clip.analysis_warning)}">⚠️ IA no disponible, resumen local</span>` : '';
+    const transcript = clip.analysis === 'done' && clip.transcript
+      ? `<details class="live-clip-transcript" data-clip="${esc(clip.clip_id)}" ${openTranscripts.has(clip.clip_id) ? 'open' : ''}>
+           <summary>Ver transcripción</summary>${esc(clip.transcript)}</details>`
+      : '';
     row.innerHTML = `
-      <div>
-        <strong>${esc(clip.clip_id)}</strong> (${Number(clip.window_seconds)}s)
-        <div class="muted" style="font-size:11px;">${esc(clip.reason || '')}</div>
+      <div class="live-clip-main">
+        <div class="live-clip-title">${title}</div>
+        ${summary}
+        <div class="live-clip-meta">
+          <span>${Number(clip.window_seconds)}s</span>
+          <span>${esc(clip.reason || '')}</span>
+          ${clip.verdict && clip.analysis === 'done' ? `<span>· ${esc(clip.verdict)}</span>` : ''}
+          ${clip.auto_status ? `<span>· ${esc(clip.auto_status)}</span>` : ''}
+          ${warn}
+        </div>
+        ${transcript}
       </div>
-      <span class="badge ${badgeClass}">${badgeLabel}</span>
+      <div class="live-clip-side">
+        <span class="badge ${badgeClass}">${badgeLabel}</span>
+        ${scoreBadge}
+      </div>
     `;
+    row.querySelector('details')?.addEventListener('click', (e) => e.stopPropagation());
     row.addEventListener('click', () => {
       document.getElementById('proc-source').value = clip.path;
       switchTab('process');
@@ -402,12 +443,38 @@ async function refreshStatus() {
     renderStyleGrid('ed-style-grid', 'ed-caption-style', document.getElementById('ed-caption-style').value || 'highlight');
 
     const tr = data.translators || {};
+    state.translators = tr;
+    const evalBtn = document.getElementById('batch-evaluate-btn');
+    if (evalBtn) {
+      const anyAi = ['claude', 'codex', 'gemini'].some((k) => tr[k]?.available);
+      evalBtn.textContent = anyAi ? '✨ Títulos + ranking IA' : '🏆 Recalcular ranking';
+    }
     const badges = document.getElementById('agent-badges');
     badges.innerHTML = `
       <span class="badge ${tr.claude?.available ? 'ok' : 'off'}">Claude ${tr.claude?.available ? 'OK' : 'N/D'}</span>
       <span class="badge ${tr.codex?.available ? 'ok' : 'off'}">Codex ${tr.codex?.available ? 'OK' : 'N/D'}</span>
       <span class="badge ${tr.gemini?.available ? 'ok' : 'off'}">Gemini ${tr.gemini?.available ? 'OK' : 'Instalar CLI'}</span>
     `;
+    const liveAi = document.getElementById('live-summary-engine');
+    if (liveAi) {
+      Array.from(liveAi.options).forEach((opt) => {
+        const info = tr[opt.value];
+        if (!opt.value || !info) return;
+        opt.textContent = info.available ? `📝 Resumen con ${info.label}` : `📝 ${info.label} (no instalado)`;
+        opt.disabled = !info.available;
+      });
+      if (liveAi.value && !tr[liveAi.value]?.available) liveAi.value = '';
+    }
+    const procAi = document.getElementById('proc-ai-engine');
+    if (procAi) {
+      Array.from(procAi.options).forEach((opt) => {
+        const info = tr[opt.value];
+        if (!opt.value || !info) return;
+        opt.textContent = info.available ? `${info.label} ✓` : `${info.label} (no instalado)`;
+        opt.disabled = !info.available;
+      });
+      if (procAi.value && !tr[procAi.value]?.available) procAi.value = '';
+    }
     const engineSelect = document.getElementById('tr-engine');
     if (engineSelect) {
       Array.from(engineSelect.options).forEach((opt) => {
@@ -560,6 +627,13 @@ async function refreshBatches() {
     state.batches = data.batches;
     const select = document.getElementById('batch-select');
     select.innerHTML = '';
+    if (state.batches.length) {
+      const total = state.batches.reduce((n, b) => n + b.clips.length, 0);
+      const allOpt = document.createElement('option');
+      allOpt.value = '__all__';
+      allOpt.textContent = `📚 Todos los clips procesados (${total})`;
+      select.appendChild(allOpt);
+    }
     if (!state.batches.length) {
       select.innerHTML = '<option value="">Sin proyectos aún</option>';
       document.getElementById('clip-selector').innerHTML = '<div class="muted">Genera tu primer clip en "Generar Clips 9:16".</div>';
@@ -579,7 +653,7 @@ async function refreshBatches() {
     if (!state.selectedBatchId || !state.batches.some((b) => b.id === state.selectedBatchId)) {
       state.selectedBatchId = state.batches[0].id;
     }
-    select.value = state.selectedBatchId;
+    select.value = state.viewAll ? '__all__' : state.selectedBatchId;
     renderClipList();
   } catch (err) {
     showToast(err.message, true);
@@ -603,16 +677,34 @@ function renderPreviewApprovalBanner(batch) {
   if (firstClip?.layout) document.getElementById('preview-layout').value = firstClip.layout;
 }
 
+function clipPool() {
+  // All processed clips across projects (global ranking) or the clips of one project.
+  const batches = state.viewAll ? state.batches : state.batches.filter((b) => b.id === state.selectedBatchId);
+  const pool = batches.flatMap((b) => b.clips.map((c) => ({ ...c, _batch: b.id, _batchName: b.display_name || b.id })));
+  if (state.viewAll) {
+    const ranked = pool
+      .filter((c) => c.review_status !== 'discarded' && c.quality)
+      .sort((a, b) => (b.quality.score_precise ?? b.quality.score) - (a.quality.score_precise ?? a.quality.score));
+    pool.forEach((c) => {
+      const pos = ranked.indexOf(c);
+      c.rank = pos >= 0 ? pos + 1 : null;
+      c.is_best = pos === 0 && ranked.length > 1;
+    });
+  }
+  return pool;
+}
+
 function renderClipList() {
   const batch = state.batches.find((b) => b.id === state.selectedBatchId);
   renderPreviewApprovalBanner(batch);
   const box = document.getElementById('clip-selector');
   box.innerHTML = '';
-  if (!batch || !batch.clips.length) {
-    box.innerHTML = '<div class="muted">Este proyecto no tiene clips.</div>';
+  const pool = clipPool();
+  if (!pool.length) {
+    box.innerHTML = '<div class="muted">No hay clips procesados todavía.</div>';
     return;
   }
-  const filtered = batch.clips.filter((c) => {
+  const filtered = pool.filter((c) => {
     if (state.clipFilter === 'active') return c.review_status !== 'discarded';
     return c.review_status === state.clipFilter;
   });
@@ -620,25 +712,39 @@ function renderClipList() {
     box.innerHTML = '<div class="muted">No hay clips en este filtro.</div>';
     return;
   }
-  if (!state.selectedClipId || !filtered.some((c) => c.id === state.selectedClipId)) {
+  if (state.clipSort === 'rank') {
+    filtered.sort((a, b) => (a.rank ?? 999) - (b.rank ?? 999) || a.id.localeCompare(b.id));
+  }
+  const isSel = (c) => c._batch === state.selectedBatchId && c.id === state.selectedClipId;
+  if (!filtered.some(isSel)) {
+    state.selectedBatchId = filtered[0]._batch;
     state.selectedClipId = filtered[0].id;
   }
   filtered.forEach((clip) => {
     const st = statusLabel(clip.review_status);
     const card = document.createElement('div');
-    card.className = `clip-card ${clip.id === state.selectedClipId ? 'selected' : ''}`;
-    const thumbUrl = `/api/thumb?batch=${encodeURIComponent(batch.id)}&clip=${encodeURIComponent(clip.id)}&_=${Math.round(clip.end * 10)}`;
+    card.className = `clip-card ${isSel(clip) ? 'selected' : ''} ${clip.is_best ? 'best' : ''}`;
+    const q = clip.quality;
+    const rankHtml = clip.rank ? `<span class="rank-chip">${clip.is_best ? '🏆' : '#' + clip.rank}</span>` : '';
+    const scoreHtml = q ? `<span class="badge ${scoreClass(q.score)}" title="${esc(q.verdict || '')}">${q.score}/100</span>` : '';
+    const thumbUrl = `/api/thumb?batch=${encodeURIComponent(clip._batch)}&clip=${encodeURIComponent(clip.id)}&_=${Math.round(clip.end * 10)}`;
+    const uploaded = Object.entries(clip.uploads || {}).filter(([, u]) => ['uploaded', 'already'].includes(u.status)).map(([p]) => (p === 'youtube' ? '▶️' : '🎵')).join('');
     card.innerHTML = `
       <img class="clip-thumb" src="${thumbUrl}" alt="${esc(clip.id)}" />
       <div>
+        ${state.viewAll ? `<div class="clip-card-batch">${esc(clip._batchName)}</div>` : ''}
         <div class="clip-card-title">${esc(clip.display_title || clip.id)}</div>
         <div class="clip-card-meta">
+          ${rankHtml}
+          ${scoreHtml}
           <span>${Math.round(clip.end - clip.start)}s</span>
           <span class="badge ${st.cls}">${st.text}</span>
+          ${uploaded ? `<span title="Subido">${uploaded}</span>` : ''}
         </div>
       </div>
     `;
     card.addEventListener('click', () => {
+      state.selectedBatchId = clip._batch;
       state.selectedClipId = clip.id;
       renderClipList();
       loadSelectedClip();
@@ -646,6 +752,131 @@ function renderClipList() {
     box.appendChild(card);
   });
   loadSelectedClip();
+}
+
+function scoreClass(score) {
+  if (score >= 75) return 'ok';
+  if (score >= 58) return 'auto';
+  if (score >= 42) return 'warn';
+  return 'danger';
+}
+
+function renderQualityCard(clip) {
+  const box = document.getElementById('clip-quality-card');
+  if (!box) return;
+  const q = clip?.quality;
+  if (!q) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  box.classList.remove('hidden');
+  const rankText = clip.rank ? (clip.is_best ? '🏆 Mejor clip del proyecto' : `Puesto #${clip.rank}`) : 'Sin ranking (descartado)';
+  const source = q.source === 'ai+local'
+    ? `IA (${esc(q.engine || '')}) ${q.ai_score}/100 + local ${q.local_score}/100`
+    : 'Puntuación local';
+  const titleSrc = { ai: 'Título generado con IA', auto: 'Título automático (local)', user: 'Título editado por ti' }[clip.title_source] || '';
+  const pros = (q.strengths || []).map((t) => `<li>${esc(t)}</li>`).join('');
+  const cons = (q.weaknesses || []).map((t) => `<li>${esc(t)}</li>`).join('');
+  box.innerHTML = `
+    <div class="quality-head">
+      <div class="quality-score ${scoreClass(q.score)}">${q.score}<small>/100</small></div>
+      <div>
+        <div><strong>${esc(q.verdict || '')}</strong> · ${rankText}</div>
+        <div class="quality-sub">${source}${titleSrc ? ' · ' + titleSrc : ''}</div>
+      </div>
+    </div>
+    ${pros ? `<ul class="quality-list pros">${pros}</ul>` : ''}
+    ${cons ? `<ul class="quality-list cons">${cons}</ul>` : ''}
+    ${q.ai_reason ? `<div class="quality-ai">🤖 ${esc(q.ai_reason)}</div>` : ''}
+  `;
+}
+
+function renderUploads(clip) {
+  const box = document.getElementById('clip-uploads');
+  const entries = Object.entries(clip?.uploads || {});
+  if (!entries.length) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  box.classList.remove('hidden');
+  box.innerHTML = entries.map(([platform, u]) => {
+    const name = platform === 'youtube' ? '▶️ YouTube' : '🎵 TikTok';
+    if (u.status === 'uploaded' || u.status === 'already') {
+      const where = platform === 'youtube'
+        ? `<a href="${esc(u.url || 'https://studio.youtube.com/')}" target="_blank" rel="noreferrer">privado · abrir en Studio ↗</a>`
+        : 'borrador enviado a tu bandeja de TikTok (ábrelo en la app para publicarlo)';
+      return `<div>${name}: ✅ ${where}</div>`;
+    }
+    return `<div>${name}: ⚠️ ${esc(u.error || u.status)}</div>`;
+  }).join('');
+}
+
+async function publishSelectedClip(platform) {
+  const clip = getSelectedClipObj();
+  if (!clip) return showToast('Selecciona un clip.', true);
+  try {
+    await api('/api/clip/publish', {
+      method: 'POST',
+      body: JSON.stringify({ batch: state.selectedBatchId, clip: clip.id, platforms: [platform] }),
+    });
+    refreshQueue();
+    showToast(`Subiendo a ${platform === 'youtube' ? 'YouTube (privado)' : 'TikTok (borrador)'} en la cola...`);
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+async function refreshPublish() {
+  try {
+    const { publish } = await api('/api/publish');
+    state.publish = publish;
+    const setBadge = (id, on) => {
+      const el = document.getElementById(id);
+      el.textContent = on ? 'Conectado' : 'No conectado';
+      el.className = `badge ${on ? 'ok' : 'off'}`;
+    };
+    setBadge('pub-yt-status', publish.connected.youtube);
+    setBadge('pub-tt-status', publish.connected.tiktok);
+    document.getElementById('pub-yt-secret').value = publish.youtube.client_secret || '';
+    document.getElementById('pub-yt-channel').value = publish.youtube.channel_id || '';
+    document.getElementById('pub-tt-key').value = publish.tiktok.client_key || '';
+    document.getElementById('pub-tt-secret').value = publish.tiktok.client_secret || '';
+    document.getElementById('pub-tt-redirect').textContent = publish.tiktok.redirect_uri;
+    document.getElementById('pub-min-score').value = publish.auto.min_score;
+    document.getElementById('pub-daily-limit').value = publish.auto.daily_limit;
+    document.getElementById('pub-hashtags').value = publish.auto.hashtags;
+    document.getElementById('pub-today').textContent = `YT ${publish.today.youtube} · TT ${publish.today.tiktok}`;
+    document.getElementById('live-min-score').value = publish.auto.min_score;
+    document.getElementById('live-pub-youtube').disabled = !publish.connected.youtube;
+    document.getElementById('live-pub-tiktok').disabled = !publish.connected.tiktok;
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+async function savePublishSettings() {
+  const { publish } = await api('/api/publish/settings', {
+    method: 'POST',
+    body: JSON.stringify({
+      youtube: {
+        client_secret: document.getElementById('pub-yt-secret').value,
+        channel_id: document.getElementById('pub-yt-channel').value,
+      },
+      tiktok: {
+        client_key: document.getElementById('pub-tt-key').value,
+        client_secret: document.getElementById('pub-tt-secret').value,
+      },
+      auto: {
+        min_score: Number(document.getElementById('pub-min-score').value),
+        daily_limit: Number(document.getElementById('pub-daily-limit').value),
+        hashtags: document.getElementById('pub-hashtags').value,
+      },
+    }),
+  });
+  state.publish = publish;
+  await refreshPublish();
 }
 
 async function loadSelectedClip() {
@@ -656,6 +887,15 @@ async function loadSelectedClip() {
   player.src = `/api/media?batch=${encodeURIComponent(state.selectedBatchId)}&clip=${encodeURIComponent(clip.id)}&t=${Date.now()}`;
 
   document.getElementById('clip-title-input').value = clip.display_title || clip.id;
+  renderQualityCard(clip);
+  renderUploads(clip);
+  document.getElementById('ed-burn-title').checked = clip.burn_title !== false;
+  const note = document.getElementById('clip-title-note');
+  const stale = clip.burn_title !== false && (clip.title_burned || '') !== (clip.display_title || '');
+  note.classList.toggle('hidden', !stale);
+  note.textContent = clip.title_burned
+    ? `⚠️ El video muestra "${clip.title_burned}". Pulsa 💾 Aplicar edición para quemar el título nuevo.`
+    : '⚠️ Este clip aún no tiene el título en el video. Pulsa 💾 Aplicar edición para agregarlo.';
   const st = statusLabel(clip.review_status);
   const badge = document.getElementById('clip-status-badge');
   badge.textContent = st.text;
@@ -913,6 +1153,8 @@ document.getElementById('ed-apply-btn').addEventListener('click', async () => {
         subtitle_offset_ms: Number(document.getElementById('ed-offset').value),
         volume_db: Number(document.getElementById('ed-vol').value),
         denoise: document.getElementById('ed-denoise').checked,
+        burn_title: document.getElementById('ed-burn-title').checked,
+        title: document.getElementById('clip-title-input').value,
       }),
     });
     refreshQueue();
@@ -1017,9 +1259,23 @@ async function refreshQueue() {
 
         if (job.status === 'done' && !state.completedJobIds.has(job.id)) {
           state.completedJobIds.add(job.id);
+          if (job.kind === 'connect') {
+            refreshPublish();
+            showToast(`${job.result?.platform === 'youtube' ? 'YouTube' : 'TikTok'} conectado ✅`);
+          }
           if (job.result?.batch_id) {
             refreshBatches();
-            if (['retest-preview', 'edit', 'auto-translate', 'rerender'].includes(job.kind)) {
+            if (job.kind === 'auto-pipeline' || job.kind === 'publish') {
+              const ups = Object.entries(job.result.uploads || {});
+              const failed = ups.filter(([, u]) => u.status === 'error');
+              if (failed.length) showToast(`Error al subir: ${failed.map(([p, u]) => `${p}: ${u.error}`).join(' · ')}`, true);
+              else if (ups.length) showToast(`Subido (${ups.map(([p, u]) => `${p}: ${u.status}`).join(', ')})`);
+              else showToast(`Clip listo: ${job.result.title || job.result.batch_id}${job.result.upload_skipped ? ' · ' + job.result.upload_skipped : ''}`);
+              loadSelectedClip();
+            } else if (job.kind === 'evaluate-batch') {
+              if (job.result.warning) showToast(job.result.warning, true);
+              else showToast(`Ranking listo · Mejor clip: ${job.result.best_clip || '-'}`);
+            } else if (['retest-preview', 'edit', 'auto-translate', 'rerender'].includes(job.kind)) {
               loadSelectedClip();
               showToast(`Listo: ${job.label}`);
             } else if (job.result.status === 'awaiting_preview_approval') {
@@ -1062,7 +1318,12 @@ document.getElementById('live-start-btn').addEventListener('click', async () => 
         auto_clip: document.getElementById('live-autoclip').checked,
         auto_clip_seconds: Number(document.getElementById('live-autoclip-seconds').value),
         auto_sensitivity: document.getElementById('live-sensitivity').value,
-        auto_process: document.getElementById('live-auto-process').checked,
+        auto_render: document.getElementById('live-auto-render').value,
+        min_score: Number(document.getElementById('live-min-score').value),
+        auto_publish: Array.from(document.querySelectorAll('.live-pub:checked')).map((el) => el.value),
+        language: document.getElementById('live-language').value,
+        voice_filter: document.getElementById('live-voice-filter').checked,
+        summary_engine: document.getElementById('live-summary-engine').value,
       }),
     });
     renderLiveStatus(res.live);
@@ -1108,7 +1369,7 @@ document.querySelectorAll('.live-cut-btn').forEach((btn) => {
         method: 'POST',
         body: JSON.stringify({
           window_seconds: Number(btn.dataset.seconds),
-          auto_process: document.getElementById('live-auto-process').checked,
+          auto_process: document.getElementById('live-auto-render').value !== 'off',
         }),
       });
       renderLiveStatus(res.live);
@@ -1140,6 +1401,9 @@ document.getElementById('proc-start-btn').addEventListener('click', async () => 
         max_seconds: Number(document.getElementById('proc-max').value),
         ranges: document.getElementById('proc-ranges').value,
         denoise: document.getElementById('proc-denoise').checked,
+        ai_engine: document.getElementById('proc-ai-engine').value,
+        voice_filter: document.getElementById('proc-voice-filter').checked,
+        burn_title: document.getElementById('proc-burn-title').checked,
       }),
     });
     refreshQueue();
@@ -1179,6 +1443,7 @@ document.getElementById('preview-continue-btn').addEventListener('click', async 
         batch: state.selectedBatchId,
         layout: document.getElementById('preview-layout').value,
         cam_region: state.previewCustomCam || undefined,
+        ai_engine: document.getElementById('proc-ai-engine').value,
       }),
     });
     refreshQueue();
@@ -1188,8 +1453,68 @@ document.getElementById('preview-continue-btn').addEventListener('click', async 
   }
 });
 
+document.getElementById('clip-sort').addEventListener('change', (e) => {
+  state.clipSort = e.target.value;
+  renderClipList();
+});
+
+document.getElementById('batch-evaluate-btn').addEventListener('click', async () => {
+  if (!state.selectedBatchId) return;
+  const selected = document.getElementById('tr-engine').value;
+  const engine = state.translators[selected]?.available ? selected : '';
+  try {
+    await api('/api/batch/evaluate', {
+      method: 'POST',
+      body: JSON.stringify({
+        batch: state.selectedBatchId,
+        engine,
+        context: document.getElementById('tr-context').value,
+      }),
+    });
+    refreshQueue();
+    showToast(engine
+      ? `Generando títulos y ranking con ${engine} en la cola...`
+      : 'Sin motor IA instalado: recalculando ranking local...');
+  } catch (err) {
+    showToast(err.message, true);
+  }
+});
+
+document.getElementById('clip-pub-youtube-btn').addEventListener('click', () => publishSelectedClip('youtube'));
+document.getElementById('clip-pub-tiktok-btn').addEventListener('click', () => publishSelectedClip('tiktok'));
+document.getElementById('pub-save-settings').addEventListener('click', async () => {
+  try {
+    await savePublishSettings();
+    showToast('Configuración de publicación guardada');
+  } catch (err) {
+    showToast(err.message, true);
+  }
+});
+['youtube', 'tiktok'].forEach((platform) => {
+  const short = platform === 'youtube' ? 'yt' : 'tt';
+  document.getElementById(`pub-${short}-connect`).addEventListener('click', async () => {
+    try {
+      await savePublishSettings();
+      await api(`/api/publish/${platform}/connect`, { method: 'POST', body: '{}' });
+      refreshQueue();
+      showToast('Se abrirá el navegador: inicia sesión y autoriza la app.');
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+  document.getElementById(`pub-${short}-disconnect`).addEventListener('click', async () => {
+    try {
+      await api('/api/publish/disconnect', { method: 'POST', body: JSON.stringify({ platform }) });
+      refreshPublish();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+});
+
 document.getElementById('batch-select').addEventListener('change', (e) => {
-  state.selectedBatchId = e.target.value;
+  state.viewAll = e.target.value === '__all__';
+  if (!state.viewAll) state.selectedBatchId = e.target.value;
   state.selectedClipId = '';
   state.previewCustomCam = '';
   renderClipList();
@@ -1251,6 +1576,7 @@ document.getElementById('shutdown-btn').addEventListener('click', async () => {
 refreshStatus();
 refreshSources();
 refreshBatches();
+refreshPublish();
 refreshQueue();
 setInterval(() => {
   api('/api/live/status').then((d) => renderLiveStatus(d.live)).catch(() => {});
